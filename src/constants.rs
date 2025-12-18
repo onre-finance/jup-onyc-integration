@@ -1,14 +1,19 @@
-use solana_sdk::{pubkey, pubkey::Pubkey};
+use solana_pubkey::Pubkey;
 
-pub const ONRE_PROGRAM_ID: Pubkey = pubkey!("onreuGhHHgVzMWSkj2oQDLDtvvGvoepBPkqyaubFcwe");
+pub const ONRE_PROGRAM_ID: Pubkey =
+    solana_pubkey::pubkey!("onreuGhHHgVzMWSkj2oQDLDtvvGvoepBPkqyaubFcwe");
 pub const AMM_LABEL: &str = "OnRe";
 
 // Token Programs
-pub const TOKEN_PROGRAM: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-pub const TOKEN_22_PROGRAM: Pubkey = pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+pub const TOKEN_PROGRAM: Pubkey =
+    solana_pubkey::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+pub const TOKEN_22_PROGRAM: Pubkey =
+    solana_pubkey::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 pub const ASSOCIATED_TOKEN_PROGRAM: Pubkey =
-    pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-pub const SYSVAR_INSTRUCTIONS: Pubkey = pubkey!("Sysvar1nstructions1111111111111111111111111");
+    solana_pubkey::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+pub const SYSVAR_INSTRUCTIONS: Pubkey =
+    solana_pubkey::pubkey!("Sysvar1nstructions1111111111111111111111111");
+pub const SYSTEM_PROGRAM: Pubkey = solana_pubkey::pubkey!("11111111111111111111111111111111");
 
 // PDA Seeds
 pub const SEED_STATE: &[u8] = b"state";

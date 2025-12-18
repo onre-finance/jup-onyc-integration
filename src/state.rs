@@ -1,11 +1,10 @@
 //! Account state deserialization for OnRe protocol
 
-use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 
 use crate::constants::{ANCHOR_DISCRIMINATOR_LEN, MAX_VECTORS};
-use crate::errors::OnreAmmError;
+use crate::errors::OnreError;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -22,22 +21,17 @@ pub struct Offer {
 }
 
 impl Offer {
-    pub fn load(data: &[u8]) -> Result<Self> {
+    pub fn load(data: &[u8]) -> Result<Self, OnreError> {
         let expected_size = ANCHOR_DISCRIMINATOR_LEN + std::mem::size_of::<Offer>();
         if data.len() < expected_size {
-            return Err(OnreAmmError::DeserializationError(format!(
-                "Offer data too short: {} < {}",
-                data.len(),
-                expected_size
-            ))
-            .into());
+            return Err(OnreError::DeserializationFailed(Pubkey::default()));
         }
 
         let offer_data = &data
             [ANCHOR_DISCRIMINATOR_LEN..ANCHOR_DISCRIMINATOR_LEN + std::mem::size_of::<Offer>()];
         bytemuck::try_from_bytes::<Offer>(offer_data)
             .map(|o| *o)
-            .map_err(|e| OnreAmmError::DeserializationError(format!("Offer: {:?}", e)).into())
+            .map_err(|_| OnreError::DeserializationFailed(Pubkey::default()))
     }
 
     pub fn needs_approval(&self) -> bool {
@@ -49,6 +43,7 @@ impl Offer {
     }
 }
 
+/// Pricing vector for time-based price evolution
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 pub struct OfferVector {
@@ -61,6 +56,7 @@ pub struct OfferVector {
 
 const MAX_ADMINS: usize = 20;
 
+/// OnRe State account structure
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct State {
@@ -79,22 +75,17 @@ pub struct State {
 }
 
 impl State {
-    pub fn load(data: &[u8]) -> Result<Self> {
+    pub fn load(data: &[u8]) -> Result<Self, OnreError> {
         let expected_size = ANCHOR_DISCRIMINATOR_LEN + std::mem::size_of::<State>();
         if data.len() < expected_size {
-            return Err(OnreAmmError::DeserializationError(format!(
-                "State data too short: {} < {}",
-                data.len(),
-                expected_size
-            ))
-            .into());
+            return Err(OnreError::DeserializationFailed(Pubkey::default()));
         }
 
         let state_data = &data
             [ANCHOR_DISCRIMINATOR_LEN..ANCHOR_DISCRIMINATOR_LEN + std::mem::size_of::<State>()];
         bytemuck::try_from_bytes::<State>(state_data)
             .map(|s| *s)
-            .map_err(|e| OnreAmmError::DeserializationError(format!("State: {:?}", e)).into())
+            .map_err(|_| OnreError::DeserializationFailed(Pubkey::default()))
     }
 
     pub fn is_killed(&self) -> bool {

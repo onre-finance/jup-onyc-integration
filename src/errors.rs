@@ -1,15 +1,22 @@
+use solana_pubkey::Pubkey;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum OnreAmmError {
+pub enum OnreError {
     #[error("Permissionless not allowed for this offer")]
     PermissionlessNotAllowed,
 
-    #[error("Invalid swap direction - only token_in → ONyc is supported")]
-    InvalidDirection,
+    #[error("No account found for pubkey: {0}")]
+    NoAccountFound(Pubkey),
 
-    #[error("Kill switch is activated")]
-    KillSwitchActivated,
+    #[error("Failed to fetch multiple accounts")]
+    FailedToFetchMultipleAccounts,
+
+    #[error("Failed to deserialize account data: {0}")]
+    DeserializationFailed(Pubkey),
+
+    #[error("Invalid mint: {0}")]
+    InvalidMint(Pubkey),
 
     #[error("State account data is missing")]
     StateMissing,
@@ -20,19 +27,18 @@ pub enum OnreAmmError {
     #[error("Math overflow")]
     MathOverflow,
 
-    #[error("Failed to deserialize account: {0}")]
-    DeserializationError(String),
+    #[error("Exact Out swap type is not supported")]
+    ExactOutNotSupported,
 
-    #[error("Invalid mint account data")]
-    InvalidMintData,
+    #[error("Token info does not extend to index {0}")]
+    TokenInfoIndexError(usize),
 
     #[error("Failed to get system time")]
     TimeError,
 
-    #[error("Max supply exceeded: minting {requested} would exceed max supply of {max_supply} (current: {current_supply})")]
-    MaxSupplyExceeded {
-        requested: u64,
-        current_supply: u64,
-        max_supply: u64,
-    },
+    #[error("Kill switch is activated")]
+    KillSwitchActivated,
+
+    #[error("Venue not initialized - call update_state first")]
+    NotInitialized,
 }

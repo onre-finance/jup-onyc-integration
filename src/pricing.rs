@@ -5,20 +5,18 @@
 //! - 5% APR = 50,000
 //! - 36.5% APR = 365,000
 
-use anyhow::Result;
-
 use crate::constants::{APR_SCALE, PRICE_DECIMALS, SECONDS_IN_YEAR};
-use crate::errors::OnreAmmError;
+use crate::errors::OnreError;
 use crate::state::{Offer, OfferVector};
 
-pub fn find_active_vector_at(offer: &Offer, time: u64) -> Result<OfferVector> {
+pub fn find_active_vector_at(offer: &Offer, time: u64) -> Result<OfferVector, OnreError> {
     offer
         .vectors
         .iter()
         .filter(|v| v.start_time != 0 && v.start_time <= time)
         .max_by_key(|v| v.start_time)
         .copied()
-        .ok_or_else(|| OnreAmmError::NoActiveVector.into())
+        .ok_or(OnreError::NoActiveVector)
 }
 
 /// Calculates the price for a specific time using discrete interval pricing
@@ -33,9 +31,9 @@ pub fn calculate_step_price_at(
     base_time: u64,
     price_fix_duration: u64,
     time: u64,
-) -> Result<u64> {
+) -> Result<u64, OnreError> {
     if base_time > time {
-        return Err(OnreAmmError::NoActiveVector.into());
+        return Err(OnreError::NoActiveVector);
     }
 
     let elapsed_since_start = time.saturating_sub(base_time);
@@ -43,9 +41,9 @@ pub fn calculate_step_price_at(
 
     let step_end_time = current_step
         .checked_add(1)
-        .ok_or(OnreAmmError::MathOverflow)?
+        .ok_or(OnreError::MathOverflow)?
         .checked_mul(price_fix_duration)
-        .ok_or(OnreAmmError::MathOverflow)?;
+        .ok_or(OnreError::MathOverflow)?;
 
     calculate_vector_price(apr, base_price, step_end_time)
 }
@@ -53,27 +51,31 @@ pub fn calculate_step_price_at(
 /// Calculates continuous price growth using APR-based linear interest
 ///
 /// Formula: P(t) = P0 * (1 + apr * elapsed_time / SECONDS_IN_YEAR)
-pub fn calculate_vector_price(apr: u64, base_price: u64, elapsed_time: u64) -> Result<u64> {
+pub fn calculate_vector_price(
+    apr: u64,
+    base_price: u64,
+    elapsed_time: u64,
+) -> Result<u64, OnreError> {
     let factor_den = APR_SCALE
         .checked_mul(SECONDS_IN_YEAR)
         .expect("APR_SCALE * SECONDS_IN_YEAR overflow");
 
     let y_part = (apr as u128)
         .checked_mul(elapsed_time as u128)
-        .ok_or(OnreAmmError::MathOverflow)?;
+        .ok_or(OnreError::MathOverflow)?;
 
     let factor_num = factor_den
         .checked_add(y_part)
-        .ok_or(OnreAmmError::MathOverflow)?;
+        .ok_or(OnreError::MathOverflow)?;
 
     let price_u128 = (base_price as u128)
         .checked_mul(factor_num)
-        .ok_or(OnreAmmError::MathOverflow)?
+        .ok_or(OnreError::MathOverflow)?
         .checked_div(factor_den)
-        .ok_or(OnreAmmError::MathOverflow)?;
+        .ok_or(OnreError::MathOverflow)?;
 
     if price_u128 > u64::MAX as u128 {
-        return Err(OnreAmmError::MathOverflow.into());
+        return Err(OnreError::MathOverflow);
     }
 
     Ok(price_u128 as u64)
@@ -88,21 +90,21 @@ pub fn calculate_token_out_amount(
     price: u64,
     token_in_decimals: u8,
     token_out_decimals: u8,
-) -> Result<u64> {
+) -> Result<u64, OnreError> {
     let token_in_u128 = token_in_amount as u128;
     let price_u128 = price as u128;
 
     let numerator = token_in_u128
         .checked_mul(10_u128.pow((token_out_decimals + PRICE_DECIMALS) as u32))
-        .ok_or(OnreAmmError::MathOverflow)?;
+        .ok_or(OnreError::MathOverflow)?;
 
     let denominator = price_u128
         .checked_mul(10_u128.pow(token_in_decimals as u32))
-        .ok_or(OnreAmmError::MathOverflow)?;
+        .ok_or(OnreError::MathOverflow)?;
 
     let result = numerator
         .checked_div(denominator)
-        .ok_or(OnreAmmError::MathOverflow)?;
+        .ok_or(OnreError::MathOverflow)?;
 
     Ok(result as u64)
 }
