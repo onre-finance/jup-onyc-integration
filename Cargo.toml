@@ -1,10 +1,10 @@
 [package]
-name = "onre-jupiter"
+name = "onre-titan"
 version = "0.1.0"
 edition = "2021"
-description = "Jupiter AMM integration for OnRe Protocol"
+description = "Titan TradingVenue integration for OnRe Protocol"
 license = "MIT"
-repository = "https://github.com/onre-finance/jup-onyc-integration"
+repository = "https://github.com/onre-finance/onre-titan-integration"
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -13,15 +13,21 @@ crate-type = ["cdylib", "lib"]
 default = []
 
 [dependencies]
-anyhow = "1.0.89"
-jupiter-amm-interface = "0.4.5"
-rust_decimal = "1.36.0"
-solana-sdk = "2.0.10"
-spl-token = { version = "6.0.0", features = ["no-entrypoint"] }
-spl-token-2022 = { version = "5.0.2", features = ["no-entrypoint"] }
-spl-associated-token-account = { version = "4.0.0", features = ["no-entrypoint"] }
+async-trait = "0.1.80"
+bytemuck = { version = "1.22", features = ["derive"] }
+log = "0.4.28"
+solana-account = "2.2.1"
+solana-instruction = "2.2.1"
+solana-pubkey = "2.2.1"
+solana-program = "2.2.1"
+solana-sdk = "2.2.1"
+spl-token = { version = "7", features = ["no-entrypoint"] }
+spl-token-2022 = { version = "9", features = ["no-entrypoint"] }
+spl-associated-token-account = "6"
 thiserror = "1.0.65"
-bytemuck = { version = "1.14", features = ["derive"] }
 
 [dev-dependencies]
-tokio = "^1"
+tokio = { version = "1.38.0", features = ["full"] }
+litesvm = "0.6.1"
+rand = "0.9.2"
+env_logger = "0.11.3"
