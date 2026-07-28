@@ -22,6 +22,20 @@ pub const SEED_OFFER_VAULT_AUTHORITY: &[u8] = b"offer_vault_authority";
 pub const SEED_PERMISSIONLESS_AUTHORITY: &[u8] = b"permissionless-1";
 pub const SEED_MINT_AUTHORITY: &[u8] = b"mint_authority";
 
+// v5 PDA Seeds
+pub const SEED_REDEMPTION_OFFER: &[u8] = b"redemption_offer";
+pub const SEED_REDEMPTION_OFFER_VAULT_AUTHORITY: &[u8] = b"redemption_offer_vault_authority";
+pub const SEED_REDEMPTION_REQUEST: &[u8] = b"redemption_request";
+pub const SEED_CONFIGURABLE_VAULT: &[u8] = b"configurable_vault";
+pub const SEED_OFFER_PROCEEDS_VAULT: &[u8] = b"offer_proceeds";
+pub const SEED_OFFER_FEE_VAULT: &[u8] = b"offer_fee";
+pub const SEED_MANAGEMENT_FEE_VAULT: &[u8] = b"management_fee";
+pub const SEED_PERFORMANCE_FEE_VAULT: &[u8] = b"performance_fee";
+pub const SEED_BUFFER_STATE: &[u8] = b"buffer_state";
+pub const SEED_RESERVE_VAULT_AUTHORITY: &[u8] = b"reserve_vault_authority";
+pub const SEED_MARKET_STATS: &[u8] = b"market_stats";
+pub const SEED_CIRCULATING_SUPPLY_EXCLUDED_BALANCE: &[u8] = b"circ_supply_excl_balance";
+
 // Price decimals
 pub const PRICE_DECIMALS: u8 = 9;
 
@@ -42,3 +56,8 @@ pub const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
 
 // Instruction discriminator for take_offer_permissionless
 pub const TAKE_OFFER_PERMISSIONLESS_DISCRIMINATOR: [u8; 8] = [37, 190, 224, 77, 197, 39, 203, 230];
+
+// v5 instruction discriminators (from target/idl/onreapp.json)
+pub const TAKE_OFFER_PERMISSIONLESS_V2_DISCRIMINATOR: [u8; 8] =
+    [250, 180, 68, 89, 124, 124, 31, 250];
+pub const CREATE_REDEMPTION_REQUEST_DISCRIMINATOR: [u8; 8] = [201, 53, 181, 254, 115, 137, 70, 151];
