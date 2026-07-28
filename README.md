@@ -63,8 +63,51 @@ price = base_price * (1 + apr * step_end_time / SECONDS_IN_YEAR)
 | Property | Value |
 |----------|-------|
 | Program ID | `onreuGhHHgVzMWSkj2oQDLDtvvGvoepBPkqyaubFcwe` |
-| Instruction | `take_offer_permissionless` |
-| Discriminator | `[37, 190, 224, 77, 197, 39, 203, 230]` |
+| Mint (v1) | `take_offer_permissionless` `[37, 190, 224, 77, 197, 39, 203, 230]` |
+| Mint (v5) | `take_offer_permissionless_v2` `[250, 180, 68, 89, 124, 124, 31, 250]` |
+| Redemption (v5) | `create_redemption_request` `[201, 53, 181, 254, 115, 137, 70, 151]` |
+
+## v5 Flows
+
+### Mint (take_offer_permissionless_v2)
+
+`OnreVenue::generate_swap_instruction_v2` builds the v5 permissionless take
+with the full 33-account list: dedicated proceeds/fee configurable-vault PDAs,
+redemption vault refill accounts, ONyc buffer accrual accounts, `market_stats`,
+the circulating-supply excluded balance PDA and `state.main_offer`. The
+approval message is always `None` (aggregator flow targets
+`needs_approval = false` offers).
+
+### Redemption (create + status tracking)
+
+Fulfillment is protocol-side; the integrator surface is create + track:
+
+```rust
+use onre_titan::redemption::*;
+
+// 1. Read the redemption offer (counter seeds the new request PDA)
+let ro = RedemptionOffer::load(&redemption_offer_account.data)?;
+
+// 2. Create the request (locks ONyc in the redemption vault)
+let ix = build_create_redemption_request_instruction(
+    &redeemer, &onyc_mint, &usdc_mint, amount, ro.request_counter,
+);
+
+// 3. Track it
+let (request_pda, _) = find_redemption_request_pda(&redemption_offer_pda, ro.request_counter);
+let status = redemption_request_status(account_data)?; // Pending | PartiallyFulfilled | Closed
+```
+
+The program closes the request account when it is fully fulfilled or
+cancelled, so a missing account maps to `Closed`.
+
+### Emergency states
+
+`OnreVenue::status()` reports `Active | KillSwitchActive | OfferDisabled`;
+`quote()` returns `not_enough_liquidity` for both emergency states. On-chain
+failures classify via `classify_program_error` (6024 kill switch, 6112 offer
+disabled, 6113 redemption offer disabled, 6025 permissionless not allowed)
+so integrators can surface them as expected states instead of generic errors.
 
 ## Testing
 
@@ -73,6 +116,16 @@ Run tests:
 ```bash
 cargo test
 ```
+
+The LiteSVM integration tests (`tests/v5_integration.rs`) execute against the
+locally built v5 program. Build it first:
+
+```bash
+cd ../onre-sol && git checkout programV5 && anchor build
+```
+
+The binary is loaded from `../onre-sol/target/deploy/onreapp.so` by default;
+override with `ONREAPP_SO_PATH`.
 
 ## Titan Requirements
 
