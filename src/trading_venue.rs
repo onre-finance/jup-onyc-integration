@@ -42,6 +42,19 @@ pub enum PoolProtocol {
     OnRe,
 }
 
+/// Operational status of the venue, surfaced as an explicit state
+/// (not a generic failure) so integrators can distinguish emergency
+/// controls from transient errors.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum VenueStatus {
+    /// Offer enabled and kill switch off
+    Active,
+    /// Global kill switch is on (`State.is_killed`)
+    KillSwitchActive,
+    /// This offer is disabled (v5 `require_enabled`)
+    OfferDisabled,
+}
+
 impl From<PoolProtocol> for String {
     fn from(protocol: PoolProtocol) -> Self {
         match protocol {
@@ -146,6 +159,20 @@ impl OnreVenue {
         PoolProtocol::OnRe
     }
 
+    /// Operational status of the venue. Kill switch (global) dominates the
+    /// per-offer disabled flag.
+    pub fn status(&self) -> VenueStatus {
+        if let Some(state) = &self.state {
+            if state.is_killed() {
+                return VenueStatus::KillSwitchActive;
+            }
+        }
+        if self.offer.is_disabled() {
+            return VenueStatus::OfferDisabled;
+        }
+        VenueStatus::Active
+    }
+
     /// Get human-readable label
     pub fn label(&self) -> String {
         "OnRe".to_string()
@@ -238,17 +265,15 @@ impl OnreVenue {
             });
         }
 
-        // Check kill switch
-        if let Some(state) = &self.state {
-            if state.is_killed() {
-                return Ok(QuoteResult {
-                    input_mint: request.input_mint,
-                    output_mint: request.output_mint,
-                    amount: request.amount,
-                    expected_output: 0,
-                    not_enough_liquidity: true,
-                });
-            }
+        // Kill switch or v5 disabled offer: surface as no-liquidity, not an error
+        if self.status() != VenueStatus::Active {
+            return Ok(QuoteResult {
+                input_mint: request.input_mint,
+                output_mint: request.output_mint,
+                amount: request.amount,
+                expected_output: 0,
+                not_enough_liquidity: true,
+            });
         }
 
         // Get current time for pricing
@@ -644,6 +669,50 @@ mod tests {
         ];
         venue.initialized = true;
         venue
+    }
+
+    #[test]
+    fn test_quote_surfaces_disabled_offer_as_no_liquidity() {
+        let token_in_mint = Pubkey::new_unique();
+        let token_out_mint = Pubkey::new_unique();
+        let mut venue = test_venue(token_in_mint, token_out_mint);
+
+        // Flip the v5 disabled byte on the offer
+        let mut data = offer_bytes(&token_in_mint, &token_out_mint);
+        data[8 + 469] = 1;
+        venue.offer = Offer::load(&data).unwrap();
+
+        assert_eq!(venue.status(), VenueStatus::OfferDisabled);
+
+        let quote = venue
+            .quote(QuoteRequest {
+                input_mint: token_in_mint,
+                output_mint: token_out_mint,
+                amount: 1_000_000,
+                swap_type: SwapType::ExactIn,
+            })
+            .unwrap();
+        assert!(quote.not_enough_liquidity);
+        assert_eq!(quote.expected_output, 0);
+    }
+
+    #[test]
+    fn test_status_reports_kill_switch() {
+        let token_in_mint = Pubkey::new_unique();
+        let token_out_mint = Pubkey::new_unique();
+        let mut venue = test_venue(token_in_mint, token_out_mint);
+
+        let mut data = state_bytes(&Pubkey::new_unique(), &venue.offer_key);
+        data[72] = 1; // is_killed
+        venue.state = Some(crate::state::State::load(&data).unwrap());
+
+        assert_eq!(venue.status(), VenueStatus::KillSwitchActive);
+    }
+
+    #[test]
+    fn test_status_active_when_enabled_and_not_killed() {
+        let venue = test_venue(Pubkey::new_unique(), Pubkey::new_unique());
+        assert_eq!(venue.status(), VenueStatus::Active);
     }
 
     #[test]
