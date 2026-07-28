@@ -42,6 +42,19 @@ pub enum PoolProtocol {
     OnRe,
 }
 
+/// Operational status of the venue, surfaced as an explicit state
+/// (not a generic failure) so integrators can distinguish emergency
+/// controls from transient errors.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum VenueStatus {
+    /// Offer enabled and kill switch off
+    Active,
+    /// Global kill switch is on (`State.is_killed`)
+    KillSwitchActive,
+    /// This offer is disabled (v5 `require_enabled`)
+    OfferDisabled,
+}
+
 impl From<PoolProtocol> for String {
     fn from(protocol: PoolProtocol) -> Self {
         match protocol {
@@ -78,7 +91,30 @@ pub struct OnreVenue {
 
 impl FromAccount for OnreVenue {
     fn from_account(pubkey: &Pubkey, account: &Account) -> Result<Self, OnreError> {
+        if account.owner != ONRE_PROGRAM_ID {
+            return Err(OnreError::InvalidAccountOwner {
+                account: *pubkey,
+                expected: ONRE_PROGRAM_ID,
+                actual: account.owner,
+            });
+        }
         let offer = Offer::load(&account.data)?;
+
+        let expected_offer = Pubkey::find_program_address(
+            &[
+                SEED_OFFER,
+                offer.token_in_mint.as_ref(),
+                offer.token_out_mint.as_ref(),
+            ],
+            &ONRE_PROGRAM_ID,
+        )
+        .0;
+        if *pubkey != expected_offer {
+            return Err(OnreError::InvalidPda {
+                expected: expected_offer,
+                actual: *pubkey,
+            });
+        }
 
         if !offer.allow_permissionless() {
             return Err(OnreError::PermissionlessNotAllowed);
@@ -146,6 +182,20 @@ impl OnreVenue {
         PoolProtocol::OnRe
     }
 
+    /// Operational status of the venue. Kill switch (global) dominates the
+    /// per-offer disabled flag.
+    pub fn status(&self) -> VenueStatus {
+        if let Some(state) = &self.state {
+            if state.is_killed() {
+                return VenueStatus::KillSwitchActive;
+            }
+        }
+        if self.offer.is_disabled() {
+            return VenueStatus::OfferDisabled;
+        }
+        VenueStatus::Active
+    }
+
     /// Get human-readable label
     pub fn label(&self) -> String {
         "OnRe".to_string()
@@ -179,13 +229,43 @@ impl OnreVenue {
 
         // Update offer
         if let Some(acc) = offer_account {
-            self.offer = Offer::load(&acc.data)?;
+            if acc.owner != ONRE_PROGRAM_ID {
+                return Err(OnreError::InvalidAccountOwner {
+                    account: self.offer_key,
+                    expected: ONRE_PROGRAM_ID,
+                    actual: acc.owner,
+                });
+            }
+            let updated_offer = Offer::load(&acc.data)?;
+            let expected_offer = Pubkey::find_program_address(
+                &[
+                    SEED_OFFER,
+                    updated_offer.token_in_mint.as_ref(),
+                    updated_offer.token_out_mint.as_ref(),
+                ],
+                &ONRE_PROGRAM_ID,
+            )
+            .0;
+            if expected_offer != self.offer_key {
+                return Err(OnreError::InvalidPda {
+                    expected: expected_offer,
+                    actual: self.offer_key,
+                });
+            }
+            self.offer = updated_offer;
         } else {
             return Err(OnreError::NoAccountFound(self.offer_key));
         }
 
         // Update state
         if let Some(acc) = state_account {
+            if acc.owner != ONRE_PROGRAM_ID {
+                return Err(OnreError::InvalidAccountOwner {
+                    account: self.state_key,
+                    expected: ONRE_PROGRAM_ID,
+                    actual: acc.owner,
+                });
+            }
             self.state = Some(State::load(&acc.data)?);
         } else {
             return Err(OnreError::NoAccountFound(self.state_key));
@@ -238,17 +318,15 @@ impl OnreVenue {
             });
         }
 
-        // Check kill switch
-        if let Some(state) = &self.state {
-            if state.is_killed() {
-                return Ok(QuoteResult {
-                    input_mint: request.input_mint,
-                    output_mint: request.output_mint,
-                    amount: request.amount,
-                    expected_output: 0,
-                    not_enough_liquidity: true,
-                });
-            }
+        // Kill switch or v5 disabled offer: surface as no-liquidity, not an error
+        if self.status() != VenueStatus::Active {
+            return Ok(QuoteResult {
+                input_mint: request.input_mint,
+                output_mint: request.output_mint,
+                amount: request.amount,
+                expected_output: 0,
+                not_enough_liquidity: true,
+            });
         }
 
         // Get current time for pricing
@@ -282,9 +360,9 @@ impl OnreVenue {
 
         // Calculate fee
         let fee_amount = (request.amount as u128)
-            .checked_mul(self.offer.fee_basis_points as u128)
+            .checked_mul(self.offer.permissionless_fee_basis_points() as u128)
             .ok_or(OnreError::MathOverflow)?
-            .checked_div(MAX_BASIS_POINTS as u128)
+            .checked_div(MAX_BASIS_POINTS)
             .ok_or(OnreError::MathOverflow)? as u64;
 
         let token_in_net = request
@@ -334,6 +412,7 @@ impl OnreVenue {
     }
 
     /// Generate swap instruction for take_offer_permissionless
+    #[deprecated(note = "use generate_swap_instruction_v2 for the v5 integration")]
     pub fn generate_swap_instruction(
         &self,
         request: QuoteRequest,
@@ -429,6 +508,148 @@ impl OnreVenue {
             data,
         })
     }
+
+    /// Generate the v5 swap instruction (`take_offer_permissionless_v2`).
+    ///
+    /// The v5 permissionless take routes proceeds/fees to dedicated
+    /// configurable-vault PDAs, refills the redemption vault, accrues the
+    /// ONyc buffer, and refreshes the market-stats PDA. All PDAs are derived
+    /// per the v5 IDL. This instruction has neither an approval-message
+    /// argument nor an Instructions sysvar account.
+    pub fn generate_swap_instruction_v2(
+        &self,
+        request: QuoteRequest,
+        user: Pubkey,
+    ) -> Result<Instruction, OnreError> {
+        let state = self.state.as_ref().ok_or(OnreError::StateMissing)?;
+
+        let token_in_info = self.get_token(0)?;
+        let token_out_info = self.get_token(1)?;
+        let token_in_mint = token_in_info.pubkey;
+        let token_out_mint = token_out_info.pubkey;
+        let token_in_program = token_in_info.get_token_program();
+        let token_out_program = token_out_info.get_token_program();
+
+        let pda = |seeds: &[&[u8]]| Pubkey::find_program_address(seeds, &ONRE_PROGRAM_ID).0;
+
+        let offer_pda = pda(&[SEED_OFFER, token_in_mint.as_ref(), token_out_mint.as_ref()]);
+        let state_pda = pda(&[SEED_STATE]);
+        let vault_authority = pda(&[SEED_OFFER_VAULT_AUTHORITY]);
+        let permissionless_authority = pda(&[SEED_PERMISSIONLESS_AUTHORITY]);
+        let mint_authority = pda(&[SEED_MINT_AUTHORITY]);
+        // Redemption offer for the opposite direction (ONyc -> token_in)
+        let redemption_offer = pda(&[
+            SEED_REDEMPTION_OFFER,
+            token_out_mint.as_ref(),
+            token_in_mint.as_ref(),
+        ]);
+        let redemption_vault_authority = pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]);
+        let offer_proceeds_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_OFFER_PROCEEDS_VAULT]);
+        let permissionless_offer_fee_vault =
+            pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERMISSIONLESS_OFFER_FEE_VAULT]);
+        let management_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_MANAGEMENT_FEE_VAULT]);
+        let performance_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERFORMANCE_FEE_VAULT]);
+        let buffer_state = pda(&[SEED_BUFFER_STATE]);
+        let reserve_vault_authority = pda(&[SEED_RESERVE_VAULT_AUTHORITY]);
+        let market_stats = pda(&[SEED_MARKET_STATS]);
+        let excluded_balance = pda(&[SEED_CIRCULATING_SUPPLY_EXCLUDED_BALANCE]);
+
+        let ata = |owner: &Pubkey, mint: &Pubkey, program: &Pubkey| {
+            get_associated_token_address_with_program_id(owner, mint, program)
+        };
+
+        // Build instruction data: discriminator + amount (u64)
+        let mut data = Vec::with_capacity(16);
+        data.extend_from_slice(&TAKE_OFFER_PERMISSIONLESS_V2_DISCRIMINATOR);
+        data.extend_from_slice(&request.amount.to_le_bytes());
+
+        let accounts = vec![
+            AccountMeta::new(offer_pda, false),
+            AccountMeta::new_readonly(state_pda, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new(
+                ata(&vault_authority, &token_in_mint, &token_in_program),
+                false,
+            ),
+            AccountMeta::new(
+                ata(&vault_authority, &token_out_mint, &token_out_program),
+                false,
+            ),
+            AccountMeta::new_readonly(permissionless_authority, false),
+            AccountMeta::new(
+                ata(&permissionless_authority, &token_in_mint, &token_in_program),
+                false,
+            ),
+            AccountMeta::new(
+                ata(
+                    &permissionless_authority,
+                    &token_out_mint,
+                    &token_out_program,
+                ),
+                false,
+            ),
+            AccountMeta::new(token_in_mint, false),
+            AccountMeta::new_readonly(token_in_program, false),
+            AccountMeta::new(token_out_mint, false),
+            AccountMeta::new_readonly(token_out_program, false),
+            AccountMeta::new(ata(&user, &token_in_mint, &token_in_program), false),
+            AccountMeta::new(ata(&user, &token_out_mint, &token_out_program), false),
+            AccountMeta::new_readonly(redemption_offer, false),
+            AccountMeta::new_readonly(redemption_vault_authority, false),
+            AccountMeta::new(
+                ata(
+                    &redemption_vault_authority,
+                    &token_in_mint,
+                    &token_in_program,
+                ),
+                false,
+            ),
+            AccountMeta::new(offer_proceeds_vault, false),
+            AccountMeta::new(
+                ata(&offer_proceeds_vault, &token_in_mint, &token_in_program),
+                false,
+            ),
+            AccountMeta::new(permissionless_offer_fee_vault, false),
+            AccountMeta::new(
+                ata(
+                    &permissionless_offer_fee_vault,
+                    &token_in_mint,
+                    &token_in_program,
+                ),
+                false,
+            ),
+            AccountMeta::new_readonly(mint_authority, false),
+            AccountMeta::new(buffer_state, false),
+            AccountMeta::new(
+                ata(
+                    &reserve_vault_authority,
+                    &token_out_mint,
+                    &token_out_program,
+                ),
+                false,
+            ),
+            AccountMeta::new(
+                ata(&management_fee_vault, &token_out_mint, &token_out_program),
+                false,
+            ),
+            AccountMeta::new(
+                ata(&performance_fee_vault, &token_out_mint, &token_out_program),
+                false,
+            ),
+            AccountMeta::new(market_stats, false),
+            AccountMeta::new_readonly(excluded_balance, false),
+            AccountMeta::new(user, true),
+            AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+            AccountMeta::new_readonly(state.main_offer, false),
+        ];
+
+        Ok(Instruction {
+            program_id: ONRE_PROGRAM_ID,
+            accounts,
+            data,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -449,6 +670,238 @@ mod tests {
         // Would need a properly initialized venue to test fully
         // but demonstrates the interface
         assert_eq!(request.amount, 0);
+    }
+
+    /// Builds a minimal v5 Offer account byte blob for the given mints
+    /// (allow_permissionless=1, enabled).
+    fn offer_bytes(token_in_mint: &Pubkey, token_out_mint: &Pubkey) -> Vec<u8> {
+        let mut data = vec![0u8; 8 + 600];
+        data[..8].copy_from_slice(&OFFER_ACCOUNT_DISCRIMINATOR);
+        data[8..40].copy_from_slice(token_in_mint.as_ref());
+        data[40..72].copy_from_slice(token_out_mint.as_ref());
+        data[8 + 468] = 1; // allow_permissionless
+        data
+    }
+
+    /// Builds a minimal v5 State byte blob (borsh layout).
+    fn state_bytes(boss: &Pubkey, main_offer: &Pubkey) -> Vec<u8> {
+        let mut data = vec![0u8; 8 + 938];
+        data[..8].copy_from_slice(&STATE_ACCOUNT_DISCRIMINATOR);
+        data[8..40].copy_from_slice(boss.as_ref());
+        data[8 + 850..8 + 882].copy_from_slice(main_offer.as_ref());
+        data
+    }
+
+    fn test_venue(token_in_mint: Pubkey, token_out_mint: Pubkey) -> OnreVenue {
+        let (offer_pda, _) = Pubkey::find_program_address(
+            &[b"offer", token_in_mint.as_ref(), token_out_mint.as_ref()],
+            &ONRE_PROGRAM_ID,
+        );
+        let account = solana_account::Account {
+            lamports: 1,
+            data: offer_bytes(&token_in_mint, &token_out_mint),
+            owner: ONRE_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        };
+        let mut venue = OnreVenue::from_account(&offer_pda, &account).unwrap();
+        venue.state = Some(
+            crate::state::State::load(&state_bytes(&Pubkey::new_unique(), &offer_pda)).unwrap(),
+        );
+        venue.token_info = vec![
+            TokenInfo {
+                pubkey: token_in_mint,
+                decimals: 6,
+                is_token_2022: false,
+                supply: 0,
+                transfer_fee: None,
+                maximum_fee: None,
+            },
+            TokenInfo {
+                pubkey: token_out_mint,
+                decimals: 9,
+                is_token_2022: false,
+                supply: 0,
+                transfer_fee: None,
+                maximum_fee: None,
+            },
+        ];
+        venue.initialized = true;
+        venue
+    }
+
+    #[test]
+    fn test_quote_surfaces_disabled_offer_as_no_liquidity() {
+        let token_in_mint = Pubkey::new_unique();
+        let token_out_mint = Pubkey::new_unique();
+        let mut venue = test_venue(token_in_mint, token_out_mint);
+
+        // Flip the v5 disabled byte on the offer
+        let mut data = offer_bytes(&token_in_mint, &token_out_mint);
+        data[8 + 469] = 1;
+        venue.offer = Offer::load(&data).unwrap();
+
+        assert_eq!(venue.status(), VenueStatus::OfferDisabled);
+
+        let quote = venue
+            .quote(QuoteRequest {
+                input_mint: token_in_mint,
+                output_mint: token_out_mint,
+                amount: 1_000_000,
+                swap_type: SwapType::ExactIn,
+            })
+            .unwrap();
+        assert!(quote.not_enough_liquidity);
+        assert_eq!(quote.expected_output, 0);
+    }
+
+    #[test]
+    fn test_status_reports_kill_switch() {
+        let token_in_mint = Pubkey::new_unique();
+        let token_out_mint = Pubkey::new_unique();
+        let mut venue = test_venue(token_in_mint, token_out_mint);
+
+        let mut data = state_bytes(&Pubkey::new_unique(), &venue.offer_key);
+        data[72] = 1; // is_killed
+        venue.state = Some(crate::state::State::load(&data).unwrap());
+
+        assert_eq!(venue.status(), VenueStatus::KillSwitchActive);
+    }
+
+    #[test]
+    fn test_status_active_when_enabled_and_not_killed() {
+        let venue = test_venue(Pubkey::new_unique(), Pubkey::new_unique());
+        assert_eq!(venue.status(), VenueStatus::Active);
+    }
+
+    #[test]
+    fn test_v2_swap_instruction_data_layout() {
+        let venue = test_venue(Pubkey::new_unique(), Pubkey::new_unique());
+        let user = Pubkey::new_unique();
+
+        let ix = venue
+            .generate_swap_instruction_v2(
+                QuoteRequest {
+                    input_mint: venue.offer.token_in_mint,
+                    output_mint: venue.offer.token_out_mint,
+                    amount: 1_000_100,
+                    swap_type: SwapType::ExactIn,
+                },
+                user,
+            )
+            .unwrap();
+
+        assert_eq!(ix.program_id, ONRE_PROGRAM_ID);
+        // discriminator (from v5 IDL) + u64 amount
+        let mut expected = vec![250u8, 180, 68, 89, 124, 124, 31, 250];
+        expected.extend_from_slice(&1_000_100u64.to_le_bytes());
+        assert_eq!(ix.data, expected);
+    }
+
+    #[test]
+    fn test_v2_swap_instruction_account_list() {
+        let token_in_mint = Pubkey::new_unique();
+        let token_out_mint = Pubkey::new_unique();
+        let venue = test_venue(token_in_mint, token_out_mint);
+        let user = Pubkey::new_unique();
+
+        let ix = venue
+            .generate_swap_instruction_v2(
+                QuoteRequest {
+                    input_mint: token_in_mint,
+                    output_mint: token_out_mint,
+                    amount: 5,
+                    swap_type: SwapType::ExactIn,
+                },
+                user,
+            )
+            .unwrap();
+
+        assert_eq!(ix.accounts.len(), 32);
+
+        // Independent PDA derivations with literal seeds (from the v5 IDL)
+        let pda = |seeds: &[&[u8]]| Pubkey::find_program_address(seeds, &ONRE_PROGRAM_ID).0;
+        let ata = |owner: &Pubkey, mint: &Pubkey| {
+            get_associated_token_address_with_program_id(owner, mint, &TOKEN_PROGRAM)
+        };
+
+        let offer_pda = pda(&[b"offer", token_in_mint.as_ref(), token_out_mint.as_ref()]);
+        let state_pda = pda(&[b"state"]);
+        let vault_authority = pda(&[b"offer_vault_authority"]);
+        let permissionless_authority = pda(&[b"permissionless-1"]);
+        let redemption_offer = pda(&[
+            b"redemption_offer",
+            token_out_mint.as_ref(),
+            token_in_mint.as_ref(),
+        ]);
+        let redemption_vault_authority = pda(&[b"redemption_offer_vault_authority"]);
+        let proceeds_vault = pda(&[b"configurable_vault", b"offer_proceeds"]);
+        let permissionless_offer_fee_vault =
+            pda(&[b"configurable_vault", b"permissionless_offer_fee"]);
+        let mint_authority = pda(&[b"mint_authority"]);
+        let buffer_state = pda(&[b"buffer_state"]);
+        let reserve_vault_authority = pda(&[b"reserve_vault_authority"]);
+        let management_fee_vault = pda(&[b"configurable_vault", b"management_fee"]);
+        let performance_fee_vault = pda(&[b"configurable_vault", b"performance_fee"]);
+        let market_stats = pda(&[b"market_stats"]);
+        let excluded_balance = pda(&[b"circ_supply_excl_balance"]);
+
+        let expected: Vec<(Pubkey, bool, bool)> = vec![
+            (offer_pda, true, false),
+            (state_pda, false, false),
+            (vault_authority, false, false),
+            (ata(&vault_authority, &token_in_mint), true, false),
+            (ata(&vault_authority, &token_out_mint), true, false),
+            (permissionless_authority, false, false),
+            (ata(&permissionless_authority, &token_in_mint), true, false),
+            (ata(&permissionless_authority, &token_out_mint), true, false),
+            (token_in_mint, true, false),
+            (TOKEN_PROGRAM, false, false),
+            (token_out_mint, true, false),
+            (TOKEN_PROGRAM, false, false),
+            (ata(&user, &token_in_mint), true, false),
+            (ata(&user, &token_out_mint), true, false),
+            (redemption_offer, false, false),
+            (redemption_vault_authority, false, false),
+            (
+                ata(&redemption_vault_authority, &token_in_mint),
+                true,
+                false,
+            ),
+            (proceeds_vault, true, false),
+            (ata(&proceeds_vault, &token_in_mint), true, false),
+            (permissionless_offer_fee_vault, true, false),
+            (
+                ata(&permissionless_offer_fee_vault, &token_in_mint),
+                true,
+                false,
+            ),
+            (mint_authority, false, false),
+            (buffer_state, true, false),
+            (ata(&reserve_vault_authority, &token_out_mint), true, false),
+            (ata(&management_fee_vault, &token_out_mint), true, false),
+            (ata(&performance_fee_vault, &token_out_mint), true, false),
+            (market_stats, true, false),
+            (excluded_balance, false, false),
+            (user, true, true),
+            (ASSOCIATED_TOKEN_PROGRAM, false, false),
+            (SYSTEM_PROGRAM, false, false),
+            (offer_pda, false, false), // main_offer from state.main_offer
+        ];
+
+        for (i, (key, writable, signer)) in expected.iter().enumerate() {
+            assert_eq!(ix.accounts[i].pubkey, *key, "account {} pubkey mismatch", i);
+            assert_eq!(
+                ix.accounts[i].is_writable, *writable,
+                "account {} writable mismatch",
+                i
+            );
+            assert_eq!(
+                ix.accounts[i].is_signer, *signer,
+                "account {} signer mismatch",
+                i
+            );
+        }
     }
 
     #[test]
