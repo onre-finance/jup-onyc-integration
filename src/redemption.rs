@@ -3,9 +3,11 @@
 //! Fulfillment is protocol-side (redemption_admin). The integrator surface is:
 //! create a request (locks ONyc in the redemption vault) + read back its state.
 
+use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 
-use crate::constants::ANCHOR_DISCRIMINATOR_LEN;
+use crate::constants::*;
 use crate::errors::OnreError;
 
 fn read_pubkey(data: &[u8], offset: usize) -> Pubkey {
@@ -140,6 +142,101 @@ pub fn redemption_request_status(
     }
 }
 
+/// Derives the RedemptionOffer PDA for a `token_in -> token_out` redemption
+/// (token_in is the token being redeemed, i.e. ONyc).
+pub fn find_redemption_offer_pda(token_in_mint: &Pubkey, token_out_mint: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            SEED_REDEMPTION_OFFER,
+            token_in_mint.as_ref(),
+            token_out_mint.as_ref(),
+        ],
+        &ONRE_PROGRAM_ID,
+    )
+}
+
+/// Derives the RedemptionRequest PDA for a redemption offer + request id
+/// (the offer's `request_counter` at creation time).
+pub fn find_redemption_request_pda(redemption_offer: &Pubkey, request_id: u64) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            SEED_REDEMPTION_REQUEST,
+            redemption_offer.as_ref(),
+            &request_id.to_le_bytes(),
+        ],
+        &ONRE_PROGRAM_ID,
+    )
+}
+
+/// Builds a v5 `create_redemption_request` instruction.
+///
+/// * `redemption_token_in_mint` - the token being redeemed (ONyc). The program
+///   requires this mint to be owned by SPL Token (not Token-2022).
+/// * `redemption_token_out_mint` - the token the redeemer will eventually
+///   receive on fulfillment (e.g. USDC).
+/// * `request_counter` - current `RedemptionOffer.request_counter` (fetch the
+///   offer first; the counter seeds the new request PDA).
+///
+/// Fulfillment/cancellation are protocol-side; the integrator tracks the
+/// request PDA with [`redemption_request_status`].
+pub fn build_create_redemption_request_instruction(
+    redeemer: &Pubkey,
+    redemption_token_in_mint: &Pubkey,
+    redemption_token_out_mint: &Pubkey,
+    amount: u64,
+    request_counter: u64,
+) -> Instruction {
+    let (state, _) = Pubkey::find_program_address(&[SEED_STATE], &ONRE_PROGRAM_ID);
+    let (redemption_offer, _) =
+        find_redemption_offer_pda(redemption_token_in_mint, redemption_token_out_mint);
+    // The mint-side Offer runs in the opposite direction (token_out -> token_in)
+    let (offer, _) = Pubkey::find_program_address(
+        &[
+            SEED_OFFER,
+            redemption_token_out_mint.as_ref(),
+            redemption_token_in_mint.as_ref(),
+        ],
+        &ONRE_PROGRAM_ID,
+    );
+    let (redemption_request, _) = find_redemption_request_pda(&redemption_offer, request_counter);
+    let (vault_authority, _) =
+        Pubkey::find_program_address(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY], &ONRE_PROGRAM_ID);
+
+    let redeemer_token_account = get_associated_token_address_with_program_id(
+        redeemer,
+        redemption_token_in_mint,
+        &TOKEN_PROGRAM,
+    );
+    let vault_token_account = get_associated_token_address_with_program_id(
+        &vault_authority,
+        redemption_token_in_mint,
+        &TOKEN_PROGRAM,
+    );
+
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&CREATE_REDEMPTION_REQUEST_DISCRIMINATOR);
+    data.extend_from_slice(&amount.to_le_bytes());
+
+    Instruction {
+        program_id: ONRE_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(state, false),
+            AccountMeta::new(redemption_offer, false),
+            AccountMeta::new_readonly(offer, false),
+            AccountMeta::new(redemption_request, false),
+            AccountMeta::new(*redeemer, true),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(*redemption_token_in_mint, false),
+            AccountMeta::new(redeemer_token_account, false),
+            AccountMeta::new(vault_token_account, false),
+            AccountMeta::new_readonly(TOKEN_PROGRAM, false),
+            AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+        ],
+        data,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +271,94 @@ mod tests {
         d[8 + 72..8 + 80].copy_from_slice(&amount.to_le_bytes());
         d[8 + 81..8 + 89].copy_from_slice(&fulfilled_amount.to_le_bytes());
         d
+    }
+
+    #[test]
+    fn test_create_redemption_request_instruction_layout() {
+        use crate::constants::*;
+
+        let redeemer = Pubkey::new_unique();
+        let onyc_mint = Pubkey::new_unique(); // redemption token_in
+        let usdc_mint = Pubkey::new_unique(); // redemption token_out
+        let counter = 5u64;
+
+        let ix = build_create_redemption_request_instruction(
+            &redeemer, &onyc_mint, &usdc_mint, 750, counter,
+        );
+
+        assert_eq!(ix.program_id, ONRE_PROGRAM_ID);
+
+        // data: discriminator (from v5 IDL) + u64 amount
+        let mut expected = vec![201u8, 53, 181, 254, 115, 137, 70, 151];
+        expected.extend_from_slice(&750u64.to_le_bytes());
+        assert_eq!(ix.data, expected);
+
+        // Independent derivations with literal seeds (from the v5 IDL)
+        let pda = |seeds: &[&[u8]]| Pubkey::find_program_address(seeds, &ONRE_PROGRAM_ID).0;
+        let ata = |owner: &Pubkey, mint: &Pubkey| {
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                owner,
+                mint,
+                &TOKEN_PROGRAM,
+            )
+        };
+
+        let state = pda(&[b"state"]);
+        let redemption_offer = pda(&[b"redemption_offer", onyc_mint.as_ref(), usdc_mint.as_ref()]);
+        // The mint-side offer runs in the opposite direction: USDC -> ONyc
+        let offer = pda(&[b"offer", usdc_mint.as_ref(), onyc_mint.as_ref()]);
+        let request = pda(&[
+            b"redemption_request",
+            redemption_offer.as_ref(),
+            &counter.to_le_bytes(),
+        ]);
+        let vault_authority = pda(&[b"redemption_offer_vault_authority"]);
+
+        let expected: Vec<(Pubkey, bool, bool)> = vec![
+            (state, false, false),
+            (redemption_offer, true, false),
+            (offer, false, false),
+            (request, true, false),
+            (redeemer, true, true),
+            (vault_authority, false, false),
+            (onyc_mint, false, false),
+            (ata(&redeemer, &onyc_mint), true, false),
+            (ata(&vault_authority, &onyc_mint), true, false),
+            (TOKEN_PROGRAM, false, false),
+            (ASSOCIATED_TOKEN_PROGRAM, false, false),
+            (SYSTEM_PROGRAM, false, false),
+        ];
+        assert_eq!(ix.accounts.len(), expected.len());
+        for (i, (key, writable, signer)) in expected.iter().enumerate() {
+            assert_eq!(ix.accounts[i].pubkey, *key, "account {} pubkey mismatch", i);
+            assert_eq!(
+                ix.accounts[i].is_writable, *writable,
+                "account {} writable mismatch",
+                i
+            );
+            assert_eq!(
+                ix.accounts[i].is_signer, *signer,
+                "account {} signer mismatch",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_redemption_request_pda_matches_seed_derivation() {
+        use crate::constants::ONRE_PROGRAM_ID;
+        let redemption_offer = Pubkey::new_unique();
+        let (pda, bump) = find_redemption_request_pda(&redemption_offer, 9);
+        let (expected, expected_bump) = Pubkey::find_program_address(
+            &[
+                b"redemption_request",
+                redemption_offer.as_ref(),
+                &9u64.to_le_bytes(),
+            ],
+            &ONRE_PROGRAM_ID,
+        );
+        assert_eq!(pda, expected);
+        assert_eq!(bump, expected_bump);
     }
 
     #[test]
