@@ -16,8 +16,8 @@ pub struct Offer {
     pub bump: u8,
     needs_approval: u8,
     allow_permissionless: u8,
-    _reserved1: [u8; 128],
-    _reserved2: [u8; 3],
+    disabled: u8,
+    _reserved: [u8; 130],
 }
 
 impl Offer {
@@ -40,6 +40,11 @@ impl Offer {
 
     pub fn allow_permissionless(&self) -> bool {
         self.allow_permissionless != 0
+    }
+
+    /// Whether the offer is disabled by emergency controls (v5 `require_enabled`)
+    pub fn is_disabled(&self) -> bool {
+        self.disabled != 0
     }
 }
 
@@ -96,6 +101,30 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds raw account data for a v5 Offer (zero-copy layout).
+    /// Layout after the 8-byte discriminator:
+    /// token_in_mint(32) token_out_mint(32) vectors(10*40) fee_basis_points(2)
+    /// bump(1) needs_approval(1) allow_permissionless(1) disabled(1) reserved(130)
+    fn offer_account_data(allow_permissionless: u8, disabled: u8) -> Vec<u8> {
+        let mut data = vec![0u8; 8 + 600];
+        data[8 + 466] = 1; // bump
+        data[8 + 468] = allow_permissionless;
+        data[8 + 469] = disabled;
+        data
+    }
+
+    #[test]
+    fn test_offer_load_reads_v5_disabled_flag() {
+        let data = offer_account_data(1, 1);
+        let offer = Offer::load(&data).unwrap();
+        assert!(offer.is_disabled());
+        assert!(offer.allow_permissionless());
+
+        let data = offer_account_data(1, 0);
+        let offer = Offer::load(&data).unwrap();
+        assert!(!offer.is_disabled());
+    }
 
     #[test]
     fn test_offer_size() {

@@ -14,7 +14,7 @@ default = []
 
 [dependencies]
 async-trait = "0.1.80"
-bytemuck = { version = "1.22", features = ["derive"] }
+bytemuck = { version = "1.22", features = ["derive", "min_const_generics"] }
 log = "0.4.28"
 solana-account = "2.2.1"
 solana-instruction = "2.2.1"
