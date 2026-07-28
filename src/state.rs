@@ -61,36 +61,67 @@ pub struct OfferVector {
 
 const MAX_ADMINS: usize = 20;
 
-/// OnRe State account structure
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+/// OnRe v5 State account structure.
+///
+/// The v5 program serializes State with borsh (`#[account]`, not zero-copy),
+/// so the layout is packed with no alignment padding. Parsed manually to stay
+/// defensive (no panics on malformed data).
+#[derive(Copy, Clone, Debug)]
 pub struct State {
     pub boss: Pubkey,
     pub proposed_boss: Pubkey,
     is_killed: u8,
-    _pad1: [u8; 7],
     pub onyc_mint: Pubkey,
     pub admins: [Pubkey; MAX_ADMINS],
     pub approver1: Pubkey,
     pub approver2: Pubkey,
     pub bump: u8,
-    _pad2: [u8; 7],
     pub max_supply: u64,
-    _reserved: [u8; 128],
+    pub redemption_admin: Pubkey,
+    pub max_mint_amount: u64,
+    pub main_offer: Pubkey,
+}
+
+/// Serialized size of the v5 State payload (without the 8-byte discriminator).
+const STATE_SERIALIZED_LEN: usize = 32 + 32 + 1 + 32 + MAX_ADMINS * 32 + 32 + 32 + 1 + 8 + 32 + 8 + 32 + 56;
+
+fn read_pubkey(data: &[u8], offset: usize) -> Pubkey {
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&data[offset..offset + 32]);
+    Pubkey::new_from_array(buf)
+}
+
+fn read_u64(data: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
 }
 
 impl State {
     pub fn load(data: &[u8]) -> Result<Self, OnreError> {
-        let expected_size = ANCHOR_DISCRIMINATOR_LEN + std::mem::size_of::<State>();
+        let expected_size = ANCHOR_DISCRIMINATOR_LEN + STATE_SERIALIZED_LEN;
         if data.len() < expected_size {
             return Err(OnreError::DeserializationFailed(Pubkey::default()));
         }
+        let d = &data[ANCHOR_DISCRIMINATOR_LEN..];
 
-        let state_data = &data
-            [ANCHOR_DISCRIMINATOR_LEN..ANCHOR_DISCRIMINATOR_LEN + std::mem::size_of::<State>()];
-        bytemuck::try_from_bytes::<State>(state_data)
-            .map(|s| *s)
-            .map_err(|_| OnreError::DeserializationFailed(Pubkey::default()))
+        let mut admins = [Pubkey::default(); MAX_ADMINS];
+        for (i, admin) in admins.iter_mut().enumerate() {
+            *admin = read_pubkey(d, 97 + i * 32);
+        }
+
+        Ok(State {
+            boss: read_pubkey(d, 0),
+            proposed_boss: read_pubkey(d, 32),
+            is_killed: d[64],
+            onyc_mint: read_pubkey(d, 65),
+            admins,
+            approver1: read_pubkey(d, 737),
+            approver2: read_pubkey(d, 769),
+            bump: d[801],
+            max_supply: read_u64(d, 802),
+            redemption_admin: read_pubkey(d, 810),
+            max_mint_amount: read_u64(d, 842),
+            main_offer: read_pubkey(d, 850),
+        })
     }
 
     pub fn is_killed(&self) -> bool {
@@ -124,6 +155,53 @@ mod tests {
         let data = offer_account_data(1, 0);
         let offer = Offer::load(&data).unwrap();
         assert!(!offer.is_disabled());
+    }
+
+    /// Builds raw account data for the v5 State account (borsh layout, no padding):
+    /// boss(32) proposed_boss(32) is_killed(1) onyc_mint(32) admins(20*32)
+    /// approver1(32) approver2(32) bump(1) max_supply(8) redemption_admin(32)
+    /// max_mint_amount(8) main_offer(32) reserved(56)
+    fn state_account_data(
+        boss: Pubkey,
+        is_killed: bool,
+        onyc_mint: Pubkey,
+        max_supply: u64,
+        redemption_admin: Pubkey,
+        main_offer: Pubkey,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; 8 + 938];
+        data[8..40].copy_from_slice(boss.as_ref());
+        data[72] = is_killed as u8;
+        data[73..105].copy_from_slice(onyc_mint.as_ref());
+        data[8 + 801] = 255; // bump
+        data[8 + 802..8 + 810].copy_from_slice(&max_supply.to_le_bytes());
+        data[8 + 810..8 + 842].copy_from_slice(redemption_admin.as_ref());
+        data[8 + 850..8 + 882].copy_from_slice(main_offer.as_ref());
+        data
+    }
+
+    #[test]
+    fn test_state_load_parses_v5_borsh_layout() {
+        let boss = Pubkey::new_unique();
+        let onyc_mint = Pubkey::new_unique();
+        let redemption_admin = Pubkey::new_unique();
+        let main_offer = Pubkey::new_unique();
+
+        let data = state_account_data(boss, true, onyc_mint, 42, redemption_admin, main_offer);
+        let state = State::load(&data).unwrap();
+
+        assert_eq!(state.boss, boss);
+        assert!(state.is_killed());
+        assert_eq!(state.onyc_mint, onyc_mint);
+        assert_eq!(state.bump, 255);
+        assert_eq!(state.max_supply, 42);
+        assert_eq!(state.redemption_admin, redemption_admin);
+        assert_eq!(state.main_offer, main_offer);
+    }
+
+    #[test]
+    fn test_state_load_rejects_truncated_data() {
+        assert!(State::load(&[0u8; 100]).is_err());
     }
 
     #[test]
