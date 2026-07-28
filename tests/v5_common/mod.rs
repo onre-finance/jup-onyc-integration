@@ -1,0 +1,561 @@
+//! Shared LiteSVM harness for the v5 integration tests.
+//!
+//! Only test-side admin/setup builders live here (initialize, make_offer,
+//! kill switch, ...). The integrator-facing instruction builders under test
+//! come from the `onre_titan` crate itself.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use async_trait::async_trait;
+use litesvm::types::FailedTransactionMetadata;
+use litesvm::LiteSVM;
+use onre_titan::constants::*;
+use onre_titan::errors::OnreError;
+use onre_titan::trading_venue::{AccountsCache, FromAccount, OnreVenue};
+use solana_account::Account;
+use solana_instruction::{AccountMeta, Instruction};
+use solana_pubkey::Pubkey;
+use solana_sdk::clock::Clock;
+use solana_sdk::message::Message;
+use solana_sdk::signature::Keypair;
+use solana_sdk::signer::Signer;
+use solana_sdk::transaction::Transaction;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
+
+pub const BPF_UPGRADEABLE_LOADER_ID: Pubkey =
+    solana_pubkey::pubkey!("BPFLoaderUpgradeab1e11111111111111111111111");
+pub const COMPUTE_BUDGET_PROGRAM_ID: Pubkey =
+    solana_pubkey::pubkey!("ComputeBudget111111111111111111111111111111");
+
+pub const INITIAL_LAMPORTS: u64 = 1_000_000_000;
+pub const USER_USDC_BALANCE: u64 = 10_000_000_000;
+
+pub fn pda(seeds: &[&[u8]]) -> Pubkey {
+    Pubkey::find_program_address(seeds, &ONRE_PROGRAM_ID).0
+}
+
+pub fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    get_associated_token_address_with_program_id(owner, mint, &TOKEN_PROGRAM)
+}
+
+/// Anchor global instruction discriminator: sha256("global:<name>")[..8]
+pub fn ix_discriminator(name: &str) -> [u8; 8] {
+    let preimage = format!("global:{}", name);
+    let hash = solana_sdk::hash::hash(preimage.as_bytes());
+    let mut disc = [0u8; 8];
+    disc.copy_from_slice(&hash.to_bytes()[..8]);
+    disc
+}
+
+fn program_so_path() -> PathBuf {
+    if let Ok(path) = std::env::var("ONREAPP_SO_PATH") {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../onre-sol/target/deploy/onreapp.so")
+}
+
+fn load_program(svm: &mut LiteSVM, upgrade_authority: &Pubkey) {
+    let path = program_so_path();
+    let program_bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "failed to read v5 program binary at {} ({}). Build it with `anchor build` \
+             in the onre-sol repo (branch programV5) or set ONREAPP_SO_PATH.",
+            path.display(),
+            e
+        )
+    });
+
+    // The program checks its upgrade authority during `initialize`, so it must
+    // be installed as an upgradeable program (program account + programdata).
+    let program_data_pda =
+        Pubkey::find_program_address(&[ONRE_PROGRAM_ID.as_ref()], &BPF_UPGRADEABLE_LOADER_ID).0;
+
+    let mut program_data = vec![0u8; 45 + program_bytes.len()];
+    program_data[0..4].copy_from_slice(&3u32.to_le_bytes()); // ProgramData
+    program_data[4..12].copy_from_slice(&0u64.to_le_bytes()); // slot
+    program_data[12] = 1; // upgrade authority present
+    program_data[13..45].copy_from_slice(upgrade_authority.as_ref());
+    program_data[45..].copy_from_slice(&program_bytes);
+    svm.set_account(
+        program_data_pda,
+        Account {
+            lamports: 100 * INITIAL_LAMPORTS,
+            data: program_data,
+            owner: BPF_UPGRADEABLE_LOADER_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    let mut program_account = vec![0u8; 36];
+    program_account[0..4].copy_from_slice(&2u32.to_le_bytes()); // Program
+    program_account[4..36].copy_from_slice(program_data_pda.as_ref());
+    svm.set_account(
+        ONRE_PROGRAM_ID,
+        Account {
+            lamports: INITIAL_LAMPORTS,
+            data: program_account,
+            owner: BPF_UPGRADEABLE_LOADER_ID,
+            executable: true,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+}
+
+pub fn create_mint(svm: &mut LiteSVM, decimals: u8, mint_authority: &Pubkey) -> Pubkey {
+    let mint = Keypair::new();
+    let mut data = vec![0u8; 82];
+    data[0..4].copy_from_slice(&1u32.to_le_bytes()); // authority COption::Some
+    data[4..36].copy_from_slice(mint_authority.as_ref());
+    data[44] = decimals;
+    data[45] = 1; // initialized
+    data[46..50].copy_from_slice(&1u32.to_le_bytes()); // freeze authority Some
+    data[50..82].copy_from_slice(mint_authority.as_ref());
+    svm.set_account(
+        mint.pubkey(),
+        Account {
+            lamports: INITIAL_LAMPORTS,
+            data,
+            owner: TOKEN_PROGRAM,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    mint.pubkey()
+}
+
+/// Creates an ATA holding `amount` tokens and bumps the mint supply to match.
+pub fn create_token_account(
+    svm: &mut LiteSVM,
+    mint: &Pubkey,
+    owner: &Pubkey,
+    amount: u64,
+) -> Pubkey {
+    let ata = derive_ata(owner, mint);
+    let mut data = vec![0u8; 165];
+    data[0..32].copy_from_slice(mint.as_ref());
+    data[32..64].copy_from_slice(owner.as_ref());
+    data[64..72].copy_from_slice(&amount.to_le_bytes());
+    data[108] = 1; // AccountState::Initialized
+    svm.set_account(
+        ata,
+        Account {
+            lamports: INITIAL_LAMPORTS,
+            data,
+            owner: TOKEN_PROGRAM,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    if amount > 0 {
+        let mut mint_account = svm.get_account(mint).expect("mint account not found");
+        let supply = u64::from_le_bytes(mint_account.data[36..44].try_into().unwrap());
+        mint_account.data[36..44].copy_from_slice(&(supply + amount).to_le_bytes());
+        svm.set_account(*mint, mint_account).unwrap();
+    }
+    ata
+}
+
+// ===========================================================================
+// Test-side admin instruction builders (setup only)
+// ===========================================================================
+
+pub fn build_initialize_ix(boss: &Pubkey, onyc_mint: &Pubkey) -> Instruction {
+    let program_data_pda =
+        Pubkey::find_program_address(&[ONRE_PROGRAM_ID.as_ref()], &BPF_UPGRADEABLE_LOADER_ID).0;
+    Instruction {
+        program_id: ONRE_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(pda(&[SEED_STATE]), false),
+            AccountMeta::new(pda(&[SEED_MINT_AUTHORITY]), false),
+            AccountMeta::new(pda(&[SEED_OFFER_VAULT_AUTHORITY]), false),
+            AccountMeta::new(*boss, true),
+            AccountMeta::new_readonly(ONRE_PROGRAM_ID, false),
+            AccountMeta::new(program_data_pda, false),
+            AccountMeta::new_readonly(*onyc_mint, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+        ],
+        data: ix_discriminator("initialize").to_vec(),
+    }
+}
+
+pub fn build_make_offer_ix(
+    boss: &Pubkey,
+    token_in_mint: &Pubkey,
+    token_out_mint: &Pubkey,
+    fee_basis_points: u16,
+) -> Instruction {
+    let vault_authority = pda(&[SEED_OFFER_VAULT_AUTHORITY]);
+    let offer = pda(&[SEED_OFFER, token_in_mint.as_ref(), token_out_mint.as_ref()]);
+    let mut data = ix_discriminator("make_offer").to_vec();
+    data.extend_from_slice(&fee_basis_points.to_le_bytes());
+    data.push(0); // needs_approval = false
+    data.push(1); // allow_permissionless = true
+    Instruction {
+        program_id: ONRE_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(*token_in_mint, false),
+            AccountMeta::new_readonly(TOKEN_PROGRAM, false),
+            AccountMeta::new(derive_ata(&vault_authority, token_in_mint), false),
+            AccountMeta::new_readonly(*token_out_mint, false),
+            AccountMeta::new(offer, false),
+            AccountMeta::new_readonly(pda(&[SEED_STATE]), false),
+            AccountMeta::new(*boss, true),
+            AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+        ],
+        data,
+    }
+}
+
+pub fn build_add_offer_vector_ix(
+    boss: &Pubkey,
+    token_in_mint: &Pubkey,
+    token_out_mint: &Pubkey,
+    start_time: u64,
+    base_time: u64,
+    base_price: u64,
+    apr: u64,
+    price_fix_duration: u64,
+) -> Instruction {
+    let offer = pda(&[SEED_OFFER, token_in_mint.as_ref(), token_out_mint.as_ref()]);
+    let mut data = ix_discriminator("add_offer_vector").to_vec();
+    data.push(1); // Option::Some(start_time)
+    data.extend_from_slice(&start_time.to_le_bytes());
+    data.extend_from_slice(&base_time.to_le_bytes());
+    data.extend_from_slice(&base_price.to_le_bytes());
+    data.extend_from_slice(&apr.to_le_bytes());
+    data.extend_from_slice(&price_fix_duration.to_le_bytes());
+    Instruction {
+        program_id: ONRE_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(offer, false),
+            AccountMeta::new_readonly(*token_in_mint, false),
+            AccountMeta::new_readonly(*token_out_mint, false),
+            AccountMeta::new_readonly(pda(&[SEED_STATE]), false),
+            AccountMeta::new_readonly(*boss, true),
+        ],
+        data,
+    }
+}
+
+pub fn build_set_main_offer_ix(boss: &Pubkey, offer: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: ONRE_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(pda(&[SEED_STATE]), false),
+            AccountMeta::new_readonly(*boss, true),
+            AccountMeta::new_readonly(*offer, false),
+        ],
+        data: ix_discriminator("set_main_offer").to_vec(),
+    }
+}
+
+pub fn build_make_redemption_offer_ix(
+    boss: &Pubkey,
+    token_in_mint: &Pubkey,  // token being redeemed (ONyc)
+    token_out_mint: &Pubkey, // token returned on fulfillment (USDC)
+    fee_basis_points: u16,
+) -> Instruction {
+    let vault_authority = pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]);
+    // Mint-side offer runs the opposite direction
+    let offer = pda(&[SEED_OFFER, token_out_mint.as_ref(), token_in_mint.as_ref()]);
+    let redemption_offer = pda(&[
+        SEED_REDEMPTION_OFFER,
+        token_in_mint.as_ref(),
+        token_out_mint.as_ref(),
+    ]);
+    let mut data = ix_discriminator("make_redemption_offer").to_vec();
+    data.extend_from_slice(&fee_basis_points.to_le_bytes());
+    Instruction {
+        program_id: ONRE_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(pda(&[SEED_STATE]), false),
+            AccountMeta::new_readonly(offer, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(*token_in_mint, false),
+            AccountMeta::new_readonly(TOKEN_PROGRAM, false),
+            AccountMeta::new(derive_ata(&vault_authority, token_in_mint), false),
+            AccountMeta::new_readonly(*token_out_mint, false),
+            AccountMeta::new_readonly(TOKEN_PROGRAM, false),
+            AccountMeta::new(derive_ata(&vault_authority, token_out_mint), false),
+            AccountMeta::new(redemption_offer, false),
+            AccountMeta::new(*boss, true),
+            AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+        ],
+        data,
+    }
+}
+
+pub fn build_set_offer_disabled_ix(
+    signer: &Pubkey,
+    token_in_mint: &Pubkey,
+    token_out_mint: &Pubkey,
+    disabled: bool,
+) -> Instruction {
+    let offer = pda(&[SEED_OFFER, token_in_mint.as_ref(), token_out_mint.as_ref()]);
+    let mut data = ix_discriminator("set_offer_disabled").to_vec();
+    data.push(disabled as u8);
+    Instruction {
+        program_id: ONRE_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(offer, false),
+            AccountMeta::new_readonly(pda(&[SEED_STATE]), false),
+            AccountMeta::new_readonly(*signer, true),
+        ],
+        data,
+    }
+}
+
+pub fn build_set_redemption_offer_disabled_ix(
+    signer: &Pubkey,
+    token_in_mint: &Pubkey,
+    token_out_mint: &Pubkey,
+    disabled: bool,
+) -> Instruction {
+    let redemption_offer = pda(&[
+        SEED_REDEMPTION_OFFER,
+        token_in_mint.as_ref(),
+        token_out_mint.as_ref(),
+    ]);
+    let mut data = ix_discriminator("set_redemption_offer_disabled").to_vec();
+    data.push(disabled as u8);
+    Instruction {
+        program_id: ONRE_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(redemption_offer, false),
+            AccountMeta::new_readonly(pda(&[SEED_STATE]), false),
+            AccountMeta::new_readonly(*signer, true),
+        ],
+        data,
+    }
+}
+
+pub fn build_set_kill_switch_ix(signer: &Pubkey, enable: bool) -> Instruction {
+    let mut data = ix_discriminator("set_kill_switch").to_vec();
+    data.push(enable as u8);
+    Instruction {
+        program_id: ONRE_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(pda(&[SEED_STATE]), false),
+            AccountMeta::new_readonly(*signer, true),
+        ],
+        data,
+    }
+}
+
+fn compute_budget_ix(units: u32) -> Instruction {
+    let mut data = vec![2u8]; // SetComputeUnitLimit
+    data.extend_from_slice(&units.to_le_bytes());
+    Instruction {
+        program_id: COMPUTE_BUDGET_PROGRAM_ID,
+        accounts: vec![],
+        data,
+    }
+}
+
+// ===========================================================================
+// AccountsCache backed by a LiteSVM snapshot
+// ===========================================================================
+
+pub struct SnapshotCache {
+    accounts: HashMap<Pubkey, Account>,
+}
+
+impl SnapshotCache {
+    pub fn from_svm(svm: &LiteSVM, pubkeys: &[Pubkey]) -> Self {
+        let mut accounts = HashMap::new();
+        for key in pubkeys {
+            if let Some(account) = svm.get_account(key) {
+                accounts.insert(*key, account);
+            }
+        }
+        SnapshotCache { accounts }
+    }
+}
+
+#[async_trait]
+impl AccountsCache for SnapshotCache {
+    async fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Account>, OnreError> {
+        Ok(self.accounts.get(pubkey).cloned())
+    }
+
+    async fn get_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>, OnreError> {
+        Ok(pubkeys
+            .iter()
+            .map(|k| self.accounts.get(k).cloned())
+            .collect())
+    }
+}
+
+// ===========================================================================
+// Test context
+// ===========================================================================
+
+pub struct MintOfferCtx {
+    pub svm: LiteSVM,
+    pub payer: Keypair,
+    pub user: Keypair,
+    pub usdc_mint: Pubkey,
+    pub onyc_mint: Pubkey,
+    pub offer_pda: Pubkey,
+}
+
+impl MintOfferCtx {
+    #[allow(clippy::result_large_err)]
+    pub fn send_ixs(
+        &mut self,
+        ixs: &[Instruction],
+        signers: &[&Keypair],
+    ) -> Result<litesvm::types::TransactionMetadata, FailedTransactionMetadata> {
+        let payer = signers[0].pubkey();
+        let mut all_ixs = vec![compute_budget_ix(1_400_000)];
+        all_ixs.extend_from_slice(ixs);
+        let msg = Message::new(&all_ixs, Some(&payer));
+        let tx = Transaction::new(signers, msg, self.svm.latest_blockhash());
+        self.svm.send_transaction(tx)
+    }
+
+    pub fn token_balance(&self, owner: &Pubkey, mint: &Pubkey) -> u64 {
+        let account = self
+            .svm
+            .get_account(&derive_ata(owner, mint))
+            .expect("token account not found");
+        u64::from_le_bytes(account.data[64..72].try_into().unwrap())
+    }
+
+    /// Builds an initialized OnreVenue the way an integrator would:
+    /// from_account on the offer, then update_state through AccountsCache.
+    pub fn load_venue(&self) -> OnreVenue {
+        let offer_account = self.svm.get_account(&self.offer_pda).expect("offer missing");
+        let mut venue = OnreVenue::from_account(&self.offer_pda, &offer_account)
+            .expect("failed to load venue from offer account");
+
+        let cache = SnapshotCache::from_svm(
+            &self.svm,
+            &[
+                self.offer_pda,
+                pda(&[SEED_STATE]),
+                self.usdc_mint,
+                self.onyc_mint,
+            ],
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(venue.update_state(&cache))
+            .expect("update_state failed");
+        venue
+    }
+
+    /// Creates the ONyc -> USDC redemption offer (boss-signed).
+    pub fn setup_redemption_offer(&mut self) {
+        let boss = self.payer.insecure_clone();
+        let ix = build_make_redemption_offer_ix(&boss.pubkey(), &self.onyc_mint, &self.usdc_mint, 0);
+        self.send_ixs(&[ix], &[&boss])
+            .expect("make_redemption_offer failed");
+    }
+}
+
+/// Extracts the custom program error code from a failed transaction.
+pub fn custom_error_code(failure: &FailedTransactionMetadata) -> Option<u32> {
+    use solana_sdk::instruction::InstructionError;
+    use solana_sdk::transaction::TransactionError;
+    match &failure.err {
+        TransactionError::InstructionError(_, InstructionError::Custom(code)) => Some(*code),
+        _ => None,
+    }
+}
+
+pub fn setup_mint_offer() -> MintOfferCtx {
+    setup_mint_offer_with_fee(0)
+}
+
+/// Full v5 environment: initialized state, USDC -> ONyc permissionless offer
+/// (price 1.0, apr 0), main offer set, vault/permissionless ATAs seeded and a
+/// funded user.
+pub fn setup_mint_offer_with_fee(fee_basis_points: u16) -> MintOfferCtx {
+    let mut svm = LiteSVM::new().with_precompiles();
+    let payer = Keypair::new();
+    let boss = payer.pubkey();
+    svm.airdrop(&boss, 100 * INITIAL_LAMPORTS).unwrap();
+
+    load_program(&mut svm, &boss);
+
+    // Align the chain clock with wall time so venue quotes (SystemTime::now)
+    // and on-chain pricing see the same interval.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let clock = Clock {
+        slot: 1,
+        epoch_start_timestamp: now as i64,
+        epoch: 0,
+        leader_schedule_epoch: 0,
+        unix_timestamp: now as i64,
+    };
+    svm.set_sysvar(&clock);
+
+    let onyc_mint = create_mint(&mut svm, 9, &boss);
+    let usdc_mint = create_mint(&mut svm, 6, &boss);
+
+    let mut ctx = MintOfferCtx {
+        svm,
+        payer,
+        user: Keypair::new(),
+        usdc_mint,
+        onyc_mint,
+        offer_pda: pda(&[SEED_OFFER, usdc_mint.as_ref(), onyc_mint.as_ref()]),
+    };
+
+    let boss_kp = ctx.payer.insecure_clone();
+    let ix = build_initialize_ix(&boss, &onyc_mint);
+    ctx.send_ixs(&[ix], &[&boss_kp]).expect("initialize failed");
+
+    let ix = build_make_offer_ix(&boss, &usdc_mint, &onyc_mint, fee_basis_points);
+    ctx.send_ixs(&[ix], &[&boss_kp]).expect("make_offer failed");
+
+    let ix = build_set_main_offer_ix(&boss, &ctx.offer_pda);
+    ctx.send_ixs(&[ix], &[&boss_kp])
+        .expect("set_main_offer failed");
+
+    let ix = build_add_offer_vector_ix(
+        &boss,
+        &usdc_mint,
+        &onyc_mint,
+        now,
+        now,
+        1_000_000_000, // price 1.0
+        0,             // apr 0 -> price constant across the clock skew window
+        86_400,
+    );
+    ctx.send_ixs(&[ix], &[&boss_kp])
+        .expect("add_offer_vector failed");
+
+    // Vault holds pre-minted ONyc so takes are vault-funded
+    let vault_authority = pda(&[SEED_OFFER_VAULT_AUTHORITY]);
+    create_token_account(&mut ctx.svm, &onyc_mint, &vault_authority, 1_000_000_000_000);
+    create_token_account(&mut ctx.svm, &usdc_mint, &vault_authority, 0);
+
+    let permissionless_authority = pda(&[SEED_PERMISSIONLESS_AUTHORITY]);
+    create_token_account(&mut ctx.svm, &usdc_mint, &permissionless_authority, 0);
+    create_token_account(&mut ctx.svm, &onyc_mint, &permissionless_authority, 0);
+
+    create_token_account(&mut ctx.svm, &usdc_mint, &boss, 0);
+
+    let user_pk = ctx.user.pubkey();
+    ctx.svm.airdrop(&user_pk, 10 * INITIAL_LAMPORTS).unwrap();
+    create_token_account(&mut ctx.svm, &usdc_mint, &user_pk, USER_USDC_BALANCE);
+    create_token_account(&mut ctx.svm, &onyc_mint, &user_pk, 0);
+
+    ctx
+}
