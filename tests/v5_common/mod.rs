@@ -162,6 +162,58 @@ pub fn create_token_account(
     ata
 }
 
+/// Seeds an already-initialized v5 configurable-vault authority.
+///
+/// LiteSVM 0.6 predates the runtime's SIMD-0312
+/// `CreateAccountAllowPrefund` instruction used by current onre-sol for lazy
+/// PDA creation. Pre-seeding lets this compatibility suite exercise the real
+/// mint instruction; onre-sol's own LiteSVM 0.14 suite covers lazy creation.
+pub fn create_configurable_vault(svm: &mut LiteSVM, vault_seed: &[u8], kind: u8) -> Pubkey {
+    const CONFIGURABLE_VAULT_DISCRIMINATOR: [u8; 8] = [208, 230, 235, 106, 163, 86, 250, 199];
+
+    let (vault, bump) =
+        Pubkey::find_program_address(&[SEED_CONFIGURABLE_VAULT, vault_seed], &ONRE_PROGRAM_ID);
+    let mut data = vec![0u8; 73];
+    data[..8].copy_from_slice(&CONFIGURABLE_VAULT_DISCRIMINATOR);
+    data[8] = kind;
+    data[41] = bump;
+    svm.set_account(
+        vault,
+        Account {
+            lamports: INITIAL_LAMPORTS,
+            data,
+            owner: ONRE_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    vault
+}
+
+/// Pre-seeds MarketStats for the same LiteSVM 0.6 compatibility reason as
+/// `create_configurable_vault`.
+pub fn create_market_stats(svm: &mut LiteSVM) -> Pubkey {
+    const MARKET_STATS_DISCRIMINATOR: [u8; 8] = [240, 45, 182, 233, 92, 118, 209, 83];
+
+    let (market_stats, bump) = Pubkey::find_program_address(&[SEED_MARKET_STATS], &ONRE_PROGRAM_ID);
+    let mut data = vec![0u8; 160];
+    data[..8].copy_from_slice(&MARKET_STATS_DISCRIMINATOR);
+    data[64] = bump;
+    svm.set_account(
+        market_stats,
+        Account {
+            lamports: INITIAL_LAMPORTS,
+            data,
+            owner: ONRE_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    market_stats
+}
+
 // ===========================================================================
 // Test-side admin instruction builders (setup only)
 // ===========================================================================
@@ -215,6 +267,7 @@ pub fn build_make_offer_ix(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_add_offer_vector_ix(
     boss: &Pubkey,
     token_in_mint: &Pubkey,
@@ -258,11 +311,42 @@ pub fn build_set_main_offer_ix(boss: &Pubkey, offer: &Pubkey) -> Instruction {
     }
 }
 
+pub fn build_configure_prop_amm_ix(
+    boss: &Pubkey,
+    asset_mint: &Pubkey,
+    onyc_mint: &Pubkey,
+) -> Instruction {
+    let offer = pda(&[SEED_OFFER, asset_mint.as_ref(), onyc_mint.as_ref()]);
+    let pair_state = pda(&[SEED_PROP_AMM_PAIR_STATE, offer.as_ref()]);
+    let mut data = ix_discriminator("configure_prop_amm").to_vec();
+    data.push(1); // enabled
+    data.extend_from_slice(&700u16.to_le_bytes()); // curve peg haircut
+    data.extend_from_slice(&25_000u32.to_le_bytes()); // curve exponent
+    data.extend_from_slice(&20u32.to_le_bytes()); // cadence threshold
+    data.extend_from_slice(&10_000u32.to_le_bytes()); // cadence wave
+    data.extend_from_slice(&86_400i64.to_le_bytes()); // epoch duration
+    data.extend_from_slice(&20_000u32.to_le_bytes()); // wall sensitivity
+    data.extend_from_slice(&0u64.to_le_bytes()); // no minimum sell size in test
+    Instruction {
+        program_id: ONRE_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(pda(&[SEED_STATE]), false),
+            AccountMeta::new_readonly(offer, false),
+            AccountMeta::new_readonly(*asset_mint, false),
+            AccountMeta::new(pair_state, false),
+            AccountMeta::new(*boss, true),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+        ],
+        data,
+    }
+}
+
 pub fn build_make_redemption_offer_ix(
     boss: &Pubkey,
     token_in_mint: &Pubkey,  // token being redeemed (ONyc)
     token_out_mint: &Pubkey, // token returned on fulfillment (USDC)
     fee_basis_points: u16,
+    fee_basis_points_prop_amm_sell: u16,
 ) -> Instruction {
     let vault_authority = pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]);
     // Mint-side offer runs the opposite direction
@@ -274,6 +358,7 @@ pub fn build_make_redemption_offer_ix(
     ]);
     let mut data = ix_discriminator("make_redemption_offer").to_vec();
     data.extend_from_slice(&fee_basis_points.to_le_bytes());
+    data.extend_from_slice(&fee_basis_points_prop_amm_sell.to_le_bytes());
     Instruction {
         program_id: ONRE_PROGRAM_ID,
         accounts: vec![
@@ -310,6 +395,28 @@ pub fn build_set_offer_disabled_ix(
             AccountMeta::new(offer, false),
             AccountMeta::new_readonly(pda(&[SEED_STATE]), false),
             AccountMeta::new_readonly(*signer, true),
+        ],
+        data,
+    }
+}
+
+pub fn build_update_offer_permissionless_fee_ix(
+    boss: &Pubkey,
+    token_in_mint: &Pubkey,
+    token_out_mint: &Pubkey,
+    fee_basis_points_permissionless: u16,
+) -> Instruction {
+    let offer = pda(&[SEED_OFFER, token_in_mint.as_ref(), token_out_mint.as_ref()]);
+    let mut data = ix_discriminator("update_offer_permissionless_fee").to_vec();
+    data.extend_from_slice(&fee_basis_points_permissionless.to_le_bytes());
+    Instruction {
+        program_id: ONRE_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(offer, false),
+            AccountMeta::new_readonly(*token_in_mint, false),
+            AccountMeta::new_readonly(*token_out_mint, false),
+            AccountMeta::new_readonly(pda(&[SEED_STATE]), false),
+            AccountMeta::new_readonly(*boss, true),
         ],
         data,
     }
@@ -432,10 +539,20 @@ impl MintOfferCtx {
         u64::from_le_bytes(account.data[64..72].try_into().unwrap())
     }
 
+    pub fn token_balance_or_zero(&self, owner: &Pubkey, mint: &Pubkey) -> u64 {
+        self.svm
+            .get_account(&derive_ata(owner, mint))
+            .map(|account| u64::from_le_bytes(account.data[64..72].try_into().unwrap()))
+            .unwrap_or(0)
+    }
+
     /// Builds an initialized OnreVenue the way an integrator would:
     /// from_account on the offer, then update_state through AccountsCache.
     pub fn load_venue(&self) -> OnreVenue {
-        let offer_account = self.svm.get_account(&self.offer_pda).expect("offer missing");
+        let offer_account = self
+            .svm
+            .get_account(&self.offer_pda)
+            .expect("offer missing");
         let mut venue = OnreVenue::from_account(&self.offer_pda, &offer_account)
             .expect("failed to load venue from offer account");
 
@@ -458,8 +575,24 @@ impl MintOfferCtx {
 
     /// Creates the ONyc -> USDC redemption offer (boss-signed).
     pub fn setup_redemption_offer(&mut self) {
+        self.setup_redemption_offer_with_fees(0, 0);
+    }
+
+    /// Creates the ONyc -> USDC redemption offer with independently configured
+    /// regular-redemption and Prop AMM sell fees.
+    pub fn setup_redemption_offer_with_fees(
+        &mut self,
+        fee_basis_points: u16,
+        fee_basis_points_prop_amm_sell: u16,
+    ) {
         let boss = self.payer.insecure_clone();
-        let ix = build_make_redemption_offer_ix(&boss.pubkey(), &self.onyc_mint, &self.usdc_mint, 0);
+        let ix = build_make_redemption_offer_ix(
+            &boss.pubkey(),
+            &self.onyc_mint,
+            &self.usdc_mint,
+            fee_basis_points,
+            fee_basis_points_prop_amm_sell,
+        );
         self.send_ixs(&[ix], &[&boss])
             .expect("make_redemption_offer failed");
     }
@@ -479,10 +612,19 @@ pub fn setup_mint_offer() -> MintOfferCtx {
     setup_mint_offer_with_fee(0)
 }
 
+/// Sets both fee lanes to the same value for tests that only care about the
+/// aggregate permissionless execution result.
+pub fn setup_mint_offer_with_fee(fee_basis_points: u16) -> MintOfferCtx {
+    setup_mint_offer_with_fees(fee_basis_points, fee_basis_points)
+}
+
 /// Full v5 environment: initialized state, USDC -> ONyc permissionless offer
 /// (price 1.0, apr 0), main offer set, vault/permissionless ATAs seeded and a
 /// funded user.
-pub fn setup_mint_offer_with_fee(fee_basis_points: u16) -> MintOfferCtx {
+pub fn setup_mint_offer_with_fees(
+    fee_basis_points: u16,
+    fee_basis_points_permissionless: u16,
+) -> MintOfferCtx {
     let mut svm = LiteSVM::new().with_precompiles();
     let payer = Keypair::new();
     let boss = payer.pubkey();
@@ -524,6 +666,15 @@ pub fn setup_mint_offer_with_fee(fee_basis_points: u16) -> MintOfferCtx {
     let ix = build_make_offer_ix(&boss, &usdc_mint, &onyc_mint, fee_basis_points);
     ctx.send_ixs(&[ix], &[&boss_kp]).expect("make_offer failed");
 
+    let ix = build_update_offer_permissionless_fee_ix(
+        &boss,
+        &usdc_mint,
+        &onyc_mint,
+        fee_basis_points_permissionless,
+    );
+    ctx.send_ixs(&[ix], &[&boss_kp])
+        .expect("update_offer_permissionless_fee failed");
+
     let ix = build_set_main_offer_ix(&boss, &ctx.offer_pda);
     ctx.send_ixs(&[ix], &[&boss_kp])
         .expect("set_main_offer failed");
@@ -541,9 +692,18 @@ pub fn setup_mint_offer_with_fee(fee_basis_points: u16) -> MintOfferCtx {
     ctx.send_ixs(&[ix], &[&boss_kp])
         .expect("add_offer_vector failed");
 
+    create_configurable_vault(&mut ctx.svm, SEED_OFFER_PROCEEDS_VAULT, 4);
+    create_configurable_vault(&mut ctx.svm, SEED_PERMISSIONLESS_OFFER_FEE_VAULT, 6);
+    create_market_stats(&mut ctx.svm);
+
     // Vault holds pre-minted ONyc so takes are vault-funded
     let vault_authority = pda(&[SEED_OFFER_VAULT_AUTHORITY]);
-    create_token_account(&mut ctx.svm, &onyc_mint, &vault_authority, 1_000_000_000_000);
+    create_token_account(
+        &mut ctx.svm,
+        &onyc_mint,
+        &vault_authority,
+        1_000_000_000_000,
+    );
     create_token_account(&mut ctx.svm, &usdc_mint, &vault_authority, 0);
 
     let permissionless_authority = pda(&[SEED_PERMISSIONLESS_AUTHORITY]);

@@ -28,13 +28,16 @@ pub const SEED_REDEMPTION_OFFER_VAULT_AUTHORITY: &[u8] = b"redemption_offer_vaul
 pub const SEED_REDEMPTION_REQUEST: &[u8] = b"redemption_request";
 pub const SEED_CONFIGURABLE_VAULT: &[u8] = b"configurable_vault";
 pub const SEED_OFFER_PROCEEDS_VAULT: &[u8] = b"offer_proceeds";
-pub const SEED_OFFER_FEE_VAULT: &[u8] = b"offer_fee";
+pub const SEED_PERMISSIONLESS_OFFER_FEE_VAULT: &[u8] = b"permissionless_offer_fee";
 pub const SEED_MANAGEMENT_FEE_VAULT: &[u8] = b"management_fee";
 pub const SEED_PERFORMANCE_FEE_VAULT: &[u8] = b"performance_fee";
 pub const SEED_BUFFER_STATE: &[u8] = b"buffer_state";
 pub const SEED_RESERVE_VAULT_AUTHORITY: &[u8] = b"reserve_vault_authority";
 pub const SEED_MARKET_STATS: &[u8] = b"market_stats";
 pub const SEED_CIRCULATING_SUPPLY_EXCLUDED_BALANCE: &[u8] = b"circ_supply_excl_balance";
+pub const SEED_PROP_AMM_PAIR_STATE: &[u8] = b"prop_amm_pair";
+pub const SEED_PROP_AMM_PROCEEDS_VAULT: &[u8] = b"prop_amm_proceeds";
+pub const SEED_PROP_AMM_SELL_FEE_VAULT: &[u8] = b"prop_amm_sell_fee";
 
 // Price decimals
 pub const PRICE_DECIMALS: u8 = 9;
@@ -54,6 +57,12 @@ pub const MAX_VECTORS: usize = 10;
 // Anchor discriminator length
 pub const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
 
+// v5 account discriminators (from target/idl/onreapp.json)
+pub const OFFER_ACCOUNT_DISCRIMINATOR: [u8; 8] = [215, 88, 60, 71, 170, 162, 73, 229];
+pub const STATE_ACCOUNT_DISCRIMINATOR: [u8; 8] = [216, 146, 107, 94, 104, 75, 182, 177];
+pub const REDEMPTION_OFFER_ACCOUNT_DISCRIMINATOR: [u8; 8] = [170, 229, 178, 15, 184, 107, 140, 41];
+pub const REDEMPTION_REQUEST_ACCOUNT_DISCRIMINATOR: [u8; 8] = [117, 157, 214, 214, 64, 160, 31, 58];
+
 // Instruction discriminator for take_offer_permissionless
 pub const TAKE_OFFER_PERMISSIONLESS_DISCRIMINATOR: [u8; 8] = [37, 190, 224, 77, 197, 39, 203, 230];
 
@@ -61,3 +70,5 @@ pub const TAKE_OFFER_PERMISSIONLESS_DISCRIMINATOR: [u8; 8] = [37, 190, 224, 77, 
 pub const TAKE_OFFER_PERMISSIONLESS_V2_DISCRIMINATOR: [u8; 8] =
     [250, 180, 68, 89, 124, 124, 31, 250];
 pub const CREATE_REDEMPTION_REQUEST_DISCRIMINATOR: [u8; 8] = [201, 53, 181, 254, 115, 137, 70, 151];
+pub const QUOTE_SWAP_SELL_DISCRIMINATOR: [u8; 8] = [198, 1, 48, 226, 172, 136, 51, 251];
+pub const OPEN_SWAP_SELL_DISCRIMINATOR: [u8; 8] = [93, 206, 188, 72, 45, 138, 181, 71];

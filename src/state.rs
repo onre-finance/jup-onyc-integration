@@ -3,7 +3,9 @@
 use bytemuck::{Pod, Zeroable};
 use solana_pubkey::Pubkey;
 
-use crate::constants::{ANCHOR_DISCRIMINATOR_LEN, MAX_VECTORS};
+use crate::constants::{
+    ANCHOR_DISCRIMINATOR_LEN, MAX_VECTORS, OFFER_ACCOUNT_DISCRIMINATOR, STATE_ACCOUNT_DISCRIMINATOR,
+};
 use crate::errors::OnreError;
 
 #[repr(C)]
@@ -17,7 +19,8 @@ pub struct Offer {
     needs_approval: u8,
     allow_permissionless: u8,
     disabled: u8,
-    _reserved: [u8; 130],
+    pub fee_basis_points_permissionless: u16,
+    _reserved: [u8; 128],
 }
 
 impl Offer {
@@ -26,11 +29,14 @@ impl Offer {
         if data.len() < expected_size {
             return Err(OnreError::DeserializationFailed(Pubkey::default()));
         }
+        if data[..ANCHOR_DISCRIMINATOR_LEN] != OFFER_ACCOUNT_DISCRIMINATOR {
+            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+        }
 
         let offer_data = &data
             [ANCHOR_DISCRIMINATOR_LEN..ANCHOR_DISCRIMINATOR_LEN + std::mem::size_of::<Offer>()];
         bytemuck::try_from_bytes::<Offer>(offer_data)
-            .map(|o| *o)
+            .copied()
             .map_err(|_| OnreError::DeserializationFailed(Pubkey::default()))
     }
 
@@ -40,6 +46,10 @@ impl Offer {
 
     pub fn allow_permissionless(&self) -> bool {
         self.allow_permissionless != 0
+    }
+
+    pub fn permissionless_fee_basis_points(&self) -> u16 {
+        self.fee_basis_points_permissionless
     }
 
     /// Whether the offer is disabled by emergency controls (v5 `require_enabled`)
@@ -83,7 +93,8 @@ pub struct State {
 }
 
 /// Serialized size of the v5 State payload (without the 8-byte discriminator).
-const STATE_SERIALIZED_LEN: usize = 32 + 32 + 1 + 32 + MAX_ADMINS * 32 + 32 + 32 + 1 + 8 + 32 + 8 + 32 + 56;
+const STATE_SERIALIZED_LEN: usize =
+    32 + 32 + 1 + 32 + MAX_ADMINS * 32 + 32 + 32 + 1 + 8 + 32 + 8 + 32 + 56;
 
 fn read_pubkey(data: &[u8], offset: usize) -> Pubkey {
     let mut buf = [0u8; 32];
@@ -99,6 +110,9 @@ impl State {
     pub fn load(data: &[u8]) -> Result<Self, OnreError> {
         let expected_size = ANCHOR_DISCRIMINATOR_LEN + STATE_SERIALIZED_LEN;
         if data.len() < expected_size {
+            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+        }
+        if data[..ANCHOR_DISCRIMINATOR_LEN] != STATE_ACCOUNT_DISCRIMINATOR {
             return Err(OnreError::DeserializationFailed(Pubkey::default()));
         }
         let d = &data[ANCHOR_DISCRIMINATOR_LEN..];
@@ -136,9 +150,11 @@ mod tests {
     /// Builds raw account data for a v5 Offer (zero-copy layout).
     /// Layout after the 8-byte discriminator:
     /// token_in_mint(32) token_out_mint(32) vectors(10*40) fee_basis_points(2)
-    /// bump(1) needs_approval(1) allow_permissionless(1) disabled(1) reserved(130)
+    /// bump(1) needs_approval(1) allow_permissionless(1) disabled(1)
+    /// fee_basis_points_permissionless(2) reserved(128)
     fn offer_account_data(allow_permissionless: u8, disabled: u8) -> Vec<u8> {
         let mut data = vec![0u8; 8 + 600];
+        data[..8].copy_from_slice(&OFFER_ACCOUNT_DISCRIMINATOR);
         data[8 + 466] = 1; // bump
         data[8 + 468] = allow_permissionless;
         data[8 + 469] = disabled;
@@ -170,6 +186,7 @@ mod tests {
         main_offer: Pubkey,
     ) -> Vec<u8> {
         let mut data = vec![0u8; 8 + 938];
+        data[..8].copy_from_slice(&STATE_ACCOUNT_DISCRIMINATOR);
         data[8..40].copy_from_slice(boss.as_ref());
         data[72] = is_killed as u8;
         data[73..105].copy_from_slice(onyc_mint.as_ref());

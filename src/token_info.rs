@@ -21,6 +21,10 @@ pub struct TokenInfo {
 
 impl TokenInfo {
     pub fn new(pubkey: &Pubkey, account: &Account) -> Result<Self, OnreError> {
+        if account.owner != TOKEN_PROGRAM && account.owner != TOKEN_22_PROGRAM {
+            return Err(OnreError::UnsupportedTokenProgram(account.owner));
+        }
+
         if let Ok(mint) = StateWithExtensions::<Mint>::unpack(&account.data) {
             let is_token_2022 = account.owner == TOKEN_22_PROGRAM;
 

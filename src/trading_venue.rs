@@ -91,7 +91,30 @@ pub struct OnreVenue {
 
 impl FromAccount for OnreVenue {
     fn from_account(pubkey: &Pubkey, account: &Account) -> Result<Self, OnreError> {
+        if account.owner != ONRE_PROGRAM_ID {
+            return Err(OnreError::InvalidAccountOwner {
+                account: *pubkey,
+                expected: ONRE_PROGRAM_ID,
+                actual: account.owner,
+            });
+        }
         let offer = Offer::load(&account.data)?;
+
+        let expected_offer = Pubkey::find_program_address(
+            &[
+                SEED_OFFER,
+                offer.token_in_mint.as_ref(),
+                offer.token_out_mint.as_ref(),
+            ],
+            &ONRE_PROGRAM_ID,
+        )
+        .0;
+        if *pubkey != expected_offer {
+            return Err(OnreError::InvalidPda {
+                expected: expected_offer,
+                actual: *pubkey,
+            });
+        }
 
         if !offer.allow_permissionless() {
             return Err(OnreError::PermissionlessNotAllowed);
@@ -206,13 +229,43 @@ impl OnreVenue {
 
         // Update offer
         if let Some(acc) = offer_account {
-            self.offer = Offer::load(&acc.data)?;
+            if acc.owner != ONRE_PROGRAM_ID {
+                return Err(OnreError::InvalidAccountOwner {
+                    account: self.offer_key,
+                    expected: ONRE_PROGRAM_ID,
+                    actual: acc.owner,
+                });
+            }
+            let updated_offer = Offer::load(&acc.data)?;
+            let expected_offer = Pubkey::find_program_address(
+                &[
+                    SEED_OFFER,
+                    updated_offer.token_in_mint.as_ref(),
+                    updated_offer.token_out_mint.as_ref(),
+                ],
+                &ONRE_PROGRAM_ID,
+            )
+            .0;
+            if expected_offer != self.offer_key {
+                return Err(OnreError::InvalidPda {
+                    expected: expected_offer,
+                    actual: self.offer_key,
+                });
+            }
+            self.offer = updated_offer;
         } else {
             return Err(OnreError::NoAccountFound(self.offer_key));
         }
 
         // Update state
         if let Some(acc) = state_account {
+            if acc.owner != ONRE_PROGRAM_ID {
+                return Err(OnreError::InvalidAccountOwner {
+                    account: self.state_key,
+                    expected: ONRE_PROGRAM_ID,
+                    actual: acc.owner,
+                });
+            }
             self.state = Some(State::load(&acc.data)?);
         } else {
             return Err(OnreError::NoAccountFound(self.state_key));
@@ -307,9 +360,9 @@ impl OnreVenue {
 
         // Calculate fee
         let fee_amount = (request.amount as u128)
-            .checked_mul(self.offer.fee_basis_points as u128)
+            .checked_mul(self.offer.permissionless_fee_basis_points() as u128)
             .ok_or(OnreError::MathOverflow)?
-            .checked_div(MAX_BASIS_POINTS as u128)
+            .checked_div(MAX_BASIS_POINTS)
             .ok_or(OnreError::MathOverflow)? as u64;
 
         let token_in_net = request
@@ -359,6 +412,7 @@ impl OnreVenue {
     }
 
     /// Generate swap instruction for take_offer_permissionless
+    #[deprecated(note = "use generate_swap_instruction_v2 for the v5 integration")]
     pub fn generate_swap_instruction(
         &self,
         request: QuoteRequest,
@@ -460,8 +514,8 @@ impl OnreVenue {
     /// The v5 permissionless take routes proceeds/fees to dedicated
     /// configurable-vault PDAs, refills the redemption vault, accrues the
     /// ONyc buffer, and refreshes the market-stats PDA. All PDAs are derived
-    /// per the v5 IDL. The optional `approval_message` is always `None`:
-    /// aggregator flow targets offers with `needs_approval = false`.
+    /// per the v5 IDL. This instruction has neither an approval-message
+    /// argument nor an Instructions sysvar account.
     pub fn generate_swap_instruction_v2(
         &self,
         request: QuoteRequest,
@@ -491,7 +545,8 @@ impl OnreVenue {
         ]);
         let redemption_vault_authority = pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]);
         let offer_proceeds_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_OFFER_PROCEEDS_VAULT]);
-        let offer_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_OFFER_FEE_VAULT]);
+        let permissionless_offer_fee_vault =
+            pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERMISSIONLESS_OFFER_FEE_VAULT]);
         let management_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_MANAGEMENT_FEE_VAULT]);
         let performance_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERFORMANCE_FEE_VAULT]);
         let buffer_state = pda(&[SEED_BUFFER_STATE]);
@@ -503,11 +558,10 @@ impl OnreVenue {
             get_associated_token_address_with_program_id(owner, mint, program)
         };
 
-        // Build instruction data: discriminator + amount (u64) + Option::None approval
-        let mut data = Vec::with_capacity(17);
+        // Build instruction data: discriminator + amount (u64)
+        let mut data = Vec::with_capacity(16);
         data.extend_from_slice(&TAKE_OFFER_PERMISSIONLESS_V2_DISCRIMINATOR);
         data.extend_from_slice(&request.amount.to_le_bytes());
-        data.push(0); // approval_message: None
 
         let accounts = vec![
             AccountMeta::new(offer_pda, false),
@@ -555,9 +609,13 @@ impl OnreVenue {
                 ata(&offer_proceeds_vault, &token_in_mint, &token_in_program),
                 false,
             ),
-            AccountMeta::new(offer_fee_vault, false),
+            AccountMeta::new(permissionless_offer_fee_vault, false),
             AccountMeta::new(
-                ata(&offer_fee_vault, &token_in_mint, &token_in_program),
+                ata(
+                    &permissionless_offer_fee_vault,
+                    &token_in_mint,
+                    &token_in_program,
+                ),
                 false,
             ),
             AccountMeta::new_readonly(mint_authority, false),
@@ -580,7 +638,6 @@ impl OnreVenue {
             ),
             AccountMeta::new(market_stats, false),
             AccountMeta::new_readonly(excluded_balance, false),
-            AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS, false),
             AccountMeta::new(user, true),
             AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false),
             AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
@@ -619,6 +676,7 @@ mod tests {
     /// (allow_permissionless=1, enabled).
     fn offer_bytes(token_in_mint: &Pubkey, token_out_mint: &Pubkey) -> Vec<u8> {
         let mut data = vec![0u8; 8 + 600];
+        data[..8].copy_from_slice(&OFFER_ACCOUNT_DISCRIMINATOR);
         data[8..40].copy_from_slice(token_in_mint.as_ref());
         data[40..72].copy_from_slice(token_out_mint.as_ref());
         data[8 + 468] = 1; // allow_permissionless
@@ -628,6 +686,7 @@ mod tests {
     /// Builds a minimal v5 State byte blob (borsh layout).
     fn state_bytes(boss: &Pubkey, main_offer: &Pubkey) -> Vec<u8> {
         let mut data = vec![0u8; 8 + 938];
+        data[..8].copy_from_slice(&STATE_ACCOUNT_DISCRIMINATOR);
         data[8..40].copy_from_slice(boss.as_ref());
         data[8 + 850..8 + 882].copy_from_slice(main_offer.as_ref());
         data
@@ -733,10 +792,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(ix.program_id, ONRE_PROGRAM_ID);
-        // discriminator (from v5 IDL) + u64 amount + Option::None for approval_message
+        // discriminator (from v5 IDL) + u64 amount
         let mut expected = vec![250u8, 180, 68, 89, 124, 124, 31, 250];
         expected.extend_from_slice(&1_000_100u64.to_le_bytes());
-        expected.push(0);
         assert_eq!(ix.data, expected);
     }
 
@@ -759,7 +817,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(ix.accounts.len(), 33);
+        assert_eq!(ix.accounts.len(), 32);
 
         // Independent PDA derivations with literal seeds (from the v5 IDL)
         let pda = |seeds: &[&[u8]]| Pubkey::find_program_address(seeds, &ONRE_PROGRAM_ID).0;
@@ -771,11 +829,15 @@ mod tests {
         let state_pda = pda(&[b"state"]);
         let vault_authority = pda(&[b"offer_vault_authority"]);
         let permissionless_authority = pda(&[b"permissionless-1"]);
-        let redemption_offer =
-            pda(&[b"redemption_offer", token_out_mint.as_ref(), token_in_mint.as_ref()]);
+        let redemption_offer = pda(&[
+            b"redemption_offer",
+            token_out_mint.as_ref(),
+            token_in_mint.as_ref(),
+        ]);
         let redemption_vault_authority = pda(&[b"redemption_offer_vault_authority"]);
         let proceeds_vault = pda(&[b"configurable_vault", b"offer_proceeds"]);
-        let fee_vault = pda(&[b"configurable_vault", b"offer_fee"]);
+        let permissionless_offer_fee_vault =
+            pda(&[b"configurable_vault", b"permissionless_offer_fee"]);
         let mint_authority = pda(&[b"mint_authority"]);
         let buffer_state = pda(&[b"buffer_state"]);
         let reserve_vault_authority = pda(&[b"reserve_vault_authority"]);
@@ -801,11 +863,19 @@ mod tests {
             (ata(&user, &token_out_mint), true, false),
             (redemption_offer, false, false),
             (redemption_vault_authority, false, false),
-            (ata(&redemption_vault_authority, &token_in_mint), true, false),
+            (
+                ata(&redemption_vault_authority, &token_in_mint),
+                true,
+                false,
+            ),
             (proceeds_vault, true, false),
             (ata(&proceeds_vault, &token_in_mint), true, false),
-            (fee_vault, true, false),
-            (ata(&fee_vault, &token_in_mint), true, false),
+            (permissionless_offer_fee_vault, true, false),
+            (
+                ata(&permissionless_offer_fee_vault, &token_in_mint),
+                true,
+                false,
+            ),
             (mint_authority, false, false),
             (buffer_state, true, false),
             (ata(&reserve_vault_authority, &token_out_mint), true, false),
@@ -813,7 +883,6 @@ mod tests {
             (ata(&performance_fee_vault, &token_out_mint), true, false),
             (market_stats, true, false),
             (excluded_balance, false, false),
-            (SYSVAR_INSTRUCTIONS, false, false),
             (user, true, true),
             (ASSOCIATED_TOKEN_PROGRAM, false, false),
             (SYSTEM_PROGRAM, false, false),

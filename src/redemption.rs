@@ -31,7 +31,7 @@ fn read_u16(data: &[u8], offset: usize) -> u16 {
 /// v5 RedemptionOffer account (borsh layout):
 /// offer(32) token_in_mint(32) token_out_mint(32) executed_redemptions(16)
 /// requested_redemptions(16) fee_basis_points(2) request_counter(8) bump(1)
-/// vault_target_bps(2) disabled(1) reserved(106)
+/// vault_target_bps(2) disabled(1) fee_basis_points_prop_amm_sell(2) reserved(104)
 #[derive(Copy, Clone, Debug)]
 pub struct RedemptionOffer {
     pub offer: Pubkey,
@@ -44,13 +44,17 @@ pub struct RedemptionOffer {
     pub bump: u8,
     pub vault_target_bps: u16,
     disabled: u8,
+    pub fee_basis_points_prop_amm_sell: u16,
 }
 
-const REDEMPTION_OFFER_SERIALIZED_LEN: usize = 32 + 32 + 32 + 16 + 16 + 2 + 8 + 1 + 2 + 1 + 106;
+const REDEMPTION_OFFER_SERIALIZED_LEN: usize = 32 + 32 + 32 + 16 + 16 + 2 + 8 + 1 + 2 + 1 + 2 + 104;
 
 impl RedemptionOffer {
     pub fn load(data: &[u8]) -> Result<Self, OnreError> {
         if data.len() < ANCHOR_DISCRIMINATOR_LEN + REDEMPTION_OFFER_SERIALIZED_LEN {
+            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+        }
+        if data[..ANCHOR_DISCRIMINATOR_LEN] != REDEMPTION_OFFER_ACCOUNT_DISCRIMINATOR {
             return Err(OnreError::DeserializationFailed(Pubkey::default()));
         }
         let d = &data[ANCHOR_DISCRIMINATOR_LEN..];
@@ -65,6 +69,7 @@ impl RedemptionOffer {
             bump: d[138],
             vault_target_bps: read_u16(d, 139),
             disabled: d[141],
+            fee_basis_points_prop_amm_sell: read_u16(d, 142),
         })
     }
 
@@ -92,6 +97,9 @@ const REDEMPTION_REQUEST_SERIALIZED_LEN: usize = 32 + 8 + 32 + 8 + 1 + 8 + 119;
 impl RedemptionRequest {
     pub fn load(data: &[u8]) -> Result<Self, OnreError> {
         if data.len() < ANCHOR_DISCRIMINATOR_LEN + REDEMPTION_REQUEST_SERIALIZED_LEN {
+            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+        }
+        if data[..ANCHOR_DISCRIMINATOR_LEN] != REDEMPTION_REQUEST_ACCOUNT_DISCRIMINATOR {
             return Err(OnreError::DeserializationFailed(Pubkey::default()));
         }
         let d = &data[ANCHOR_DISCRIMINATOR_LEN..];
@@ -246,14 +254,17 @@ mod tests {
         request_counter: u64,
         requested_redemptions: u128,
         disabled: u8,
+        fee_basis_points_prop_amm_sell: u16,
     ) -> Vec<u8> {
         let mut d = vec![0u8; 8 + REDEMPTION_OFFER_SERIALIZED_LEN];
+        d[..8].copy_from_slice(&REDEMPTION_OFFER_ACCOUNT_DISCRIMINATOR);
         d[8..40].copy_from_slice(offer.as_ref());
         d[8 + 112..8 + 128].copy_from_slice(&requested_redemptions.to_le_bytes());
         d[8 + 128..8 + 130].copy_from_slice(&50u16.to_le_bytes());
         d[8 + 130..8 + 138].copy_from_slice(&request_counter.to_le_bytes());
         d[8 + 138] = 254; // bump
         d[8 + 141] = disabled;
+        d[8 + 142..8 + 144].copy_from_slice(&fee_basis_points_prop_amm_sell.to_le_bytes());
         d
     }
 
@@ -265,6 +276,7 @@ mod tests {
         fulfilled_amount: u64,
     ) -> Vec<u8> {
         let mut d = vec![0u8; 8 + REDEMPTION_REQUEST_SERIALIZED_LEN];
+        d[..8].copy_from_slice(&REDEMPTION_REQUEST_ACCOUNT_DISCRIMINATOR);
         d[8..40].copy_from_slice(offer.as_ref());
         d[8 + 32..8 + 40].copy_from_slice(&request_id.to_le_bytes());
         d[8 + 40..8 + 72].copy_from_slice(redeemer.as_ref());
@@ -364,14 +376,15 @@ mod tests {
     #[test]
     fn test_redemption_offer_parses_counter_and_disabled() {
         let offer = Pubkey::new_unique();
-        let ro = RedemptionOffer::load(&redemption_offer_data(offer, 7, 1_000, 0)).unwrap();
+        let ro = RedemptionOffer::load(&redemption_offer_data(offer, 7, 1_000, 0, 250)).unwrap();
         assert_eq!(ro.offer, offer);
         assert_eq!(ro.request_counter, 7);
         assert_eq!(ro.requested_redemptions, 1_000);
         assert_eq!(ro.fee_basis_points, 50);
+        assert_eq!(ro.fee_basis_points_prop_amm_sell, 250);
         assert!(!ro.is_disabled());
 
-        let ro = RedemptionOffer::load(&redemption_offer_data(offer, 0, 0, 1)).unwrap();
+        let ro = RedemptionOffer::load(&redemption_offer_data(offer, 0, 0, 1, 0)).unwrap();
         assert!(ro.is_disabled());
     }
 

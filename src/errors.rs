@@ -41,6 +41,31 @@ pub enum OnreError {
 
     #[error("Venue not initialized - call update_state first")]
     NotInitialized,
+
+    #[error("Unsupported token program: {0}")]
+    UnsupportedTokenProgram(Pubkey),
+
+    #[error("Invalid account owner for {account}: expected {expected}, got {actual}")]
+    InvalidAccountOwner {
+        account: Pubkey,
+        expected: Pubkey,
+        actual: Pubkey,
+    },
+
+    #[error("Invalid PDA: expected {expected}, got {actual}")]
+    InvalidPda { expected: Pubkey, actual: Pubkey },
+
+    #[error("Invalid quote return-data program: expected {expected}, got {actual}")]
+    InvalidQuoteProgram { expected: Pubkey, actual: Pubkey },
+
+    #[error("Invalid quote return-data length: expected {expected}, got {actual}")]
+    InvalidQuoteLength { expected: usize, actual: usize },
+
+    #[error("Quote does not match the requested offer, mints, or input amount")]
+    QuoteMismatch,
+
+    #[error("A positive input quote must have a non-zero minimum output")]
+    InvalidMinimumOut,
 }
 
 /// Expected on-chain failure states of the v5 program.
