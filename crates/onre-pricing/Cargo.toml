@@ -1,0 +1,8 @@
+[package]
+name = "onre-pricing"
+version = "0.1.0"
+edition = "2021"
+description = "Pricing math for the OnRe Protocol"
+license = "MIT"
+
+[dependencies]
