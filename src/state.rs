@@ -7,6 +7,7 @@ use crate::constants::{
     ANCHOR_DISCRIMINATOR_LEN, MAX_VECTORS, OFFER_ACCOUNT_DISCRIMINATOR, STATE_ACCOUNT_DISCRIMINATOR,
 };
 use crate::errors::OnreError;
+use crate::util::{read_pubkey, read_u64};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -95,16 +96,6 @@ pub struct State {
 /// Serialized size of the v5 State payload (without the 8-byte discriminator).
 const STATE_SERIALIZED_LEN: usize =
     32 + 32 + 1 + 32 + MAX_ADMINS * 32 + 32 + 32 + 1 + 8 + 32 + 8 + 32 + 56;
-
-fn read_pubkey(data: &[u8], offset: usize) -> Pubkey {
-    let mut buf = [0u8; 32];
-    buf.copy_from_slice(&data[offset..offset + 32]);
-    Pubkey::new_from_array(buf)
-}
-
-fn read_u64(data: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
-}
 
 impl State {
     pub fn load(data: &[u8]) -> Result<Self, OnreError> {

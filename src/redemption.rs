@@ -7,26 +7,15 @@ use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 
-use crate::constants::*;
+use crate::constants::{
+    ANCHOR_DISCRIMINATOR_LEN, ASSOCIATED_TOKEN_PROGRAM, CREATE_REDEMPTION_REQUEST_DISCRIMINATOR,
+    ONRE_PROGRAM_ID, REDEMPTION_OFFER_ACCOUNT_DISCRIMINATOR,
+    REDEMPTION_REQUEST_ACCOUNT_DISCRIMINATOR, SEED_OFFER, SEED_REDEMPTION_OFFER,
+    SEED_REDEMPTION_OFFER_VAULT_AUTHORITY, SEED_REDEMPTION_REQUEST, SEED_STATE, SYSTEM_PROGRAM,
+    TOKEN_PROGRAM,
+};
 use crate::errors::OnreError;
-
-fn read_pubkey(data: &[u8], offset: usize) -> Pubkey {
-    let mut buf = [0u8; 32];
-    buf.copy_from_slice(&data[offset..offset + 32]);
-    Pubkey::new_from_array(buf)
-}
-
-fn read_u64(data: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
-}
-
-fn read_u128(data: &[u8], offset: usize) -> u128 {
-    u128::from_le_bytes(data[offset..offset + 16].try_into().unwrap())
-}
-
-fn read_u16(data: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap())
-}
+use crate::util::{read_pubkey, read_u128, read_u16, read_u64};
 
 /// v5 RedemptionOffer account (borsh layout):
 /// offer(32) token_in_mint(32) token_out_mint(32) executed_redemptions(16)
