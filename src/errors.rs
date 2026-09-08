@@ -27,6 +27,18 @@ pub enum OnreError {
     #[error("Math overflow")]
     MathOverflow,
 
+    #[error("Zero price not allowed")]
+    ZeroPriceNotAllowed,
+
+    #[error("Zero price fix duration not allowed")]
+    ZeroPriceFixDurationNotAllowed,
+
+    #[error("Decimals exceed max {max}, was {was}")]
+    DecimalsExceedMax { max: u8, was: u8 },
+
+    #[error(transparent)]
+    CalculationError(onre_pricing::PricingError),
+
     #[error("Exact Out swap type is not supported")]
     ExactOutNotSupported,
 
@@ -97,6 +109,24 @@ pub fn classify_program_error(code: u32) -> Option<ExpectedFailure> {
     }
 }
 
+impl From<onre_pricing::PricingError> for OnreError {
+    fn from(e: onre_pricing::PricingError) -> Self {
+        match e {
+            onre_pricing::PricingError::MathOverflow => OnreError::MathOverflow,
+            onre_pricing::PricingError::NoActiveVector => OnreError::NoActiveVector,
+            onre_pricing::PricingError::ZeroPriceNotAllowed => OnreError::ZeroPriceNotAllowed,
+            onre_pricing::PricingError::ZeroPriceFixDurationNotAllowed => {
+                OnreError::ZeroPriceFixDurationNotAllowed
+            }
+            onre_pricing::PricingError::DecimalsExceedMax { max, was } => {
+                OnreError::DecimalsExceedMax { max, was }
+            }
+            // Any other current or future non_exhaustive variant surfaces.
+            _ => OnreError::CalculationError(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +150,16 @@ mod tests {
             Some(ExpectedFailure::PermissionlessNotAllowed)
         );
         assert_eq!(classify_program_error(1), None);
+    }
+
+    #[test]
+    fn test_unmapped_pricing_error_surfaces_faithfully() {
+        // Previously-unmapped variants must no longer collapse to MathOverflow.
+        let err: OnreError = onre_pricing::PricingError::InsufficientLiquidity.into();
+        assert!(matches!(err, OnreError::CalculationError(_)));
+        assert_eq!(
+            err.to_string(),
+            "token out amount exceeds available liquidity"
+        );
     }
 }
