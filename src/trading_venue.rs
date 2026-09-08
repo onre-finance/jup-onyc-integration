@@ -58,7 +58,7 @@ pub enum VenueStatus {
 impl From<PoolProtocol> for String {
     fn from(protocol: PoolProtocol) -> Self {
         match protocol {
-            PoolProtocol::OnRe => "OnRe".to_string(),
+            PoolProtocol::OnRe => AMM_LABEL.to_string(),
         }
     }
 }
@@ -198,7 +198,7 @@ impl OnreVenue {
 
     /// Get human-readable label
     pub fn label(&self) -> String {
-        "OnRe".to_string()
+        AMM_LABEL.to_string()
     }
 
     /// Get pubkeys required for state update
@@ -228,48 +228,45 @@ impl OnreVenue {
             .map_err(|_| OnreError::FailedToFetchMultipleAccounts)?;
 
         // Update offer
-        if let Some(acc) = offer_account {
-            if acc.owner != ONRE_PROGRAM_ID {
-                return Err(OnreError::InvalidAccountOwner {
-                    account: self.offer_key,
-                    expected: ONRE_PROGRAM_ID,
-                    actual: acc.owner,
-                });
-            }
-            let updated_offer = Offer::load(&acc.data)?;
-            let expected_offer = Pubkey::find_program_address(
-                &[
-                    SEED_OFFER,
-                    updated_offer.token_in_mint.as_ref(),
-                    updated_offer.token_out_mint.as_ref(),
-                ],
-                &ONRE_PROGRAM_ID,
-            )
-            .0;
-            if expected_offer != self.offer_key {
-                return Err(OnreError::InvalidPda {
-                    expected: expected_offer,
-                    actual: self.offer_key,
-                });
-            }
-            self.offer = updated_offer;
-        } else {
-            return Err(OnreError::NoAccountFound(self.offer_key));
+        let offer_account = offer_account.ok_or(OnreError::NoAccountFound(self.offer_key))?;
+
+        if offer_account.owner != ONRE_PROGRAM_ID {
+            return Err(OnreError::InvalidAccountOwner {
+                account: self.offer_key,
+                expected: ONRE_PROGRAM_ID,
+                actual: offer_account.owner,
+            });
         }
 
-        // Update state
-        if let Some(acc) = state_account {
-            if acc.owner != ONRE_PROGRAM_ID {
-                return Err(OnreError::InvalidAccountOwner {
-                    account: self.state_key,
-                    expected: ONRE_PROGRAM_ID,
-                    actual: acc.owner,
-                });
-            }
-            self.state = Some(State::load(&acc.data)?);
-        } else {
-            return Err(OnreError::NoAccountFound(self.state_key));
+        let updated_offer = Offer::load(&offer_account.data)?;
+        let (expected_offer_key, _) = Pubkey::find_program_address(
+            &[
+                SEED_OFFER,
+                updated_offer.token_in_mint.as_ref(),
+                updated_offer.token_out_mint.as_ref(),
+            ],
+            &ONRE_PROGRAM_ID,
+        );
+
+        if expected_offer_key != self.offer_key {
+            return Err(OnreError::InvalidPda {
+                expected: expected_offer_key,
+                actual: self.offer_key,
+            });
         }
+        self.offer = updated_offer;
+
+        // Update state
+        let state_account = state_account.ok_or(OnreError::NoAccountFound(self.state_key))?;
+
+        if state_account.owner != ONRE_PROGRAM_ID {
+            return Err(OnreError::InvalidAccountOwner {
+                account: self.state_key,
+                expected: ONRE_PROGRAM_ID,
+                actual: state_account.owner,
+            });
+        }
+        self.state = Some(State::load(&state_account.data)?);
 
         // Update token info
         let token_in_info = token_in_account
