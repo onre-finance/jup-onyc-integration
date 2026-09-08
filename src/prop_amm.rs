@@ -1,427 +1,206 @@
-//! Atomic ONyc sell primitives for OnRe's v5 proprietary AMM.
-//!
-//! A router simulates [`build_quote_swap_sell_instruction`], validates the
-//! return data with [`parse_swap_sell_quote`], and executes
-//! [`build_open_swap_sell_instruction`] with the returned `minimum_out`.
+//! PropAmmPairState deserialization for OnRe's v5 proprietary AMM.
 
-use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
-use spl_associated_token_account::get_associated_token_address_with_program_id;
 
 use crate::constants::*;
 use crate::errors::OnreError;
+use crate::util::{read_i64, read_pubkey, read_u16, read_u32, read_u64};
 
-/// Exact Borsh-serialized size of the v5 `SwapQuote` return value.
-pub const SWAP_QUOTE_SERIALIZED_LEN: usize = 152;
+pub const PROP_AMM_PAIR_STATE_RESERVED_BYTES: usize = 284;
+// 3*32 + 1 + 2 + 4 + 4 + 4 + 8 + 4 + 8 + 8 + 8 + 8 + 4 + 8 + 1 + 284
+const PROP_AMM_PAIR_STATE_SERIALIZED_LEN: usize = 452;
 
-/// A validated quote returned by `quote_swap_sell`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct SwapQuote {
+pub struct PropAmmPairState {
     pub offer: Pubkey,
-    pub token_in_mint: Pubkey,
-    pub token_out_mint: Pubkey,
-    pub token_in_amount: u64,
-    pub token_in_net_amount: u64,
-    pub token_in_fee_amount: u64,
-    pub token_out_amount: u64,
-    pub minimum_out: u64,
-    pub current_price: u64,
-    pub quoted_at: i64,
+    pub asset_mint: Pubkey,
+    pub onyc_mint: Pubkey,
+    pub enabled: bool,
+    pub curve_peg_haircut_bps: u16,
+    pub curve_exponent_scaled: u32,
+    pub cadence_threshold: u32,
+    pub cadence_wave_scaled: u32,
+    pub epoch_duration_seconds: i64,
+    pub wall_sensitivity_scaled: u32,
+    pub minimum_sell_haircut_onyc: u64,
+    pub curr_sell_value_stable: u64,
+    pub curr_buy_value_stable: u64,
+    pub prev_net_sell_value_stable: u64,
+    pub curr_sell_trade_count: u32,
+    pub epoch_start: i64,
+    pub bump: u8,
+    pub reserved: [u8; PROP_AMM_PAIR_STATE_RESERVED_BYTES],
 }
 
-fn pda(seeds: &[&[u8]]) -> Pubkey {
-    Pubkey::find_program_address(seeds, &ONRE_PROGRAM_ID).0
-}
+impl PropAmmPairState {
+    pub fn load(data: &[u8]) -> Result<Self, OnreError> {
+        if data.len() < ANCHOR_DISCRIMINATOR_LEN + PROP_AMM_PAIR_STATE_SERIALIZED_LEN {
+            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+        }
+        if data[..ANCHOR_DISCRIMINATOR_LEN] != PROP_AMM_PAIR_STATE_ACCOUNT_DISCRIMINATOR {
+            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+        }
+        let d = &data[ANCHOR_DISCRIMINATOR_LEN..];
 
-fn ata(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
-    get_associated_token_address_with_program_id(owner, mint, token_program)
-}
+        let mut reserved = [0u8; PROP_AMM_PAIR_STATE_RESERVED_BYTES];
+        reserved.copy_from_slice(&d[168..168 + PROP_AMM_PAIR_STATE_RESERVED_BYTES]);
 
-fn require_token_program(program: &Pubkey) -> Result<(), OnreError> {
-    if *program == TOKEN_PROGRAM || *program == TOKEN_22_PROGRAM {
-        Ok(())
-    } else {
-        Err(OnreError::UnsupportedTokenProgram(*program))
+        Ok(PropAmmPairState {
+            offer: read_pubkey(d, 0),
+            asset_mint: read_pubkey(d, 32),
+            onyc_mint: read_pubkey(d, 64),
+            enabled: read_bool(d, 96)?,
+            curve_peg_haircut_bps: read_u16(d, 97),
+            curve_exponent_scaled: read_u32(d, 99),
+            cadence_threshold: read_u32(d, 103),
+            cadence_wave_scaled: read_u32(d, 107),
+            epoch_duration_seconds: read_i64(d, 111),
+            wall_sensitivity_scaled: read_u32(d, 119),
+            minimum_sell_haircut_onyc: read_u64(d, 123),
+            curr_sell_value_stable: read_u64(d, 131),
+            curr_buy_value_stable: read_u64(d, 139),
+            prev_net_sell_value_stable: read_u64(d, 147),
+            curr_sell_trade_count: read_u32(d, 155),
+            epoch_start: read_i64(d, 159),
+            bump: d[167],
+            reserved,
+        })
+    }
+
+    pub fn to_dampening_state(&self) -> onre_pricing::types::DampeningState {
+        onre_pricing::types::DampeningState {
+            max_haircut_bps: self.curve_peg_haircut_bps,
+            exponent_scaled: self.curve_exponent_scaled,
+            cadence_threshold: self.cadence_threshold,
+            cadence_wave_scaled: self.cadence_wave_scaled,
+            wall_sensitivity_scaled: self.wall_sensitivity_scaled,
+            epoch_start: self.epoch_start as u64,
+            epoch_duration_seconds: self.epoch_duration_seconds as u64,
+            sell_volume: self.curr_sell_value_stable,
+            buy_volume: self.curr_buy_value_stable,
+            sell_trade_count: self.curr_sell_trade_count,
+            prev_net_sell_volume: self.prev_net_sell_value_stable,
+        }
+    }
+
+    /// `min_fee` argument for `onre_pricing::sell::calculate_amount_out`.
+    pub fn min_sell_fee(&self) -> u64 {
+        self.minimum_sell_haircut_onyc
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        !self.enabled
     }
 }
 
-fn read_pubkey(data: &[u8], offset: usize) -> Pubkey {
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&data[offset..offset + 32]);
-    Pubkey::new_from_array(bytes)
-}
-
-fn read_u64(data: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        data[offset..offset + 8]
-            .try_into()
-            .expect("validated quote length"),
-    )
-}
-
-fn read_i64(data: &[u8], offset: usize) -> i64 {
-    i64::from_le_bytes(
-        data[offset..offset + 8]
-            .try_into()
-            .expect("validated quote length"),
-    )
-}
-
-/// Build the read-only on-chain quote instruction for an atomic ONyc -> asset
-/// sell. The router must simulate it and retain the return-data program id and
-/// bytes.
-pub fn build_quote_swap_sell_instruction(
-    onyc_mint: &Pubkey,
-    asset_mint: &Pubkey,
-    asset_token_program: &Pubkey,
-    token_in_amount: u64,
-) -> Result<Instruction, OnreError> {
-    require_token_program(asset_token_program)?;
-
-    let offer = pda(&[SEED_OFFER, asset_mint.as_ref(), onyc_mint.as_ref()]);
-    let pair_state = pda(&[SEED_PROP_AMM_PAIR_STATE, offer.as_ref()]);
-    let redemption_offer = pda(&[
-        SEED_REDEMPTION_OFFER,
-        onyc_mint.as_ref(),
-        asset_mint.as_ref(),
-    ]);
-    let state = pda(&[SEED_STATE]);
-    let redemption_vault_authority = pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]);
-    let redemption_vault_asset = ata(&redemption_vault_authority, asset_mint, asset_token_program);
-    let market_stats = pda(&[SEED_MARKET_STATS]);
-
-    let mut data = Vec::with_capacity(16);
-    data.extend_from_slice(&QUOTE_SWAP_SELL_DISCRIMINATOR);
-    data.extend_from_slice(&token_in_amount.to_le_bytes());
-
-    Ok(Instruction {
-        program_id: ONRE_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new_readonly(offer, false),
-            AccountMeta::new_readonly(pair_state, false),
-            AccountMeta::new_readonly(redemption_offer, false),
-            AccountMeta::new_readonly(state, false),
-            AccountMeta::new_readonly(redemption_vault_authority, false),
-            AccountMeta::new_readonly(redemption_vault_asset, false),
-            AccountMeta::new_readonly(*onyc_mint, false),
-            AccountMeta::new_readonly(*asset_mint, false),
-            AccountMeta::new_readonly(*asset_token_program, false),
-            AccountMeta::new_readonly(market_stats, false),
-        ],
-        data,
-    })
-}
-
-/// Parse and bind simulated return data to the exact sell request.
-///
-/// `quoted_at` is informational. Execution recomputes the price and enforces
-/// `minimum_out` on chain.
-pub fn parse_swap_sell_quote(
-    return_data_program: &Pubkey,
-    data: &[u8],
-    onyc_mint: &Pubkey,
-    asset_mint: &Pubkey,
-    token_in_amount: u64,
-) -> Result<SwapQuote, OnreError> {
-    if *return_data_program != ONRE_PROGRAM_ID {
-        return Err(OnreError::InvalidQuoteProgram {
-            expected: ONRE_PROGRAM_ID,
-            actual: *return_data_program,
-        });
+fn read_bool(data: &[u8], offset: usize) -> Result<bool, OnreError> {
+    match data.get(offset) {
+        Some(&0) => Ok(false),
+        Some(&1) => Ok(true),
+        _ => Err(OnreError::DeserializationFailed(Pubkey::default())),
     }
-    if data.len() != SWAP_QUOTE_SERIALIZED_LEN {
-        return Err(OnreError::InvalidQuoteLength {
-            expected: SWAP_QUOTE_SERIALIZED_LEN,
-            actual: data.len(),
-        });
-    }
-
-    let quote = SwapQuote {
-        offer: read_pubkey(data, 0),
-        token_in_mint: read_pubkey(data, 32),
-        token_out_mint: read_pubkey(data, 64),
-        token_in_amount: read_u64(data, 96),
-        token_in_net_amount: read_u64(data, 104),
-        token_in_fee_amount: read_u64(data, 112),
-        token_out_amount: read_u64(data, 120),
-        minimum_out: read_u64(data, 128),
-        current_price: read_u64(data, 136),
-        quoted_at: read_i64(data, 144),
-    };
-    let expected_offer = pda(&[SEED_OFFER, asset_mint.as_ref(), onyc_mint.as_ref()]);
-    if quote.offer != expected_offer
-        || quote.token_in_mint != *onyc_mint
-        || quote.token_out_mint != *asset_mint
-        || quote.token_in_amount != token_in_amount
-    {
-        return Err(OnreError::QuoteMismatch);
-    }
-    if token_in_amount > 0 && quote.minimum_out == 0 {
-        return Err(OnreError::InvalidMinimumOut);
-    }
-
-    Ok(quote)
-}
-
-/// Build atomic ONyc -> asset execution with the quote's on-chain slippage
-/// guard. Callers must not replace `minimum_out` with zero.
-#[allow(clippy::too_many_arguments)]
-pub fn build_open_swap_sell_instruction(
-    user: &Pubkey,
-    onyc_mint: &Pubkey,
-    asset_mint: &Pubkey,
-    onyc_token_program: &Pubkey,
-    asset_token_program: &Pubkey,
-    state_main_offer: &Pubkey,
-    quote: &SwapQuote,
-) -> Result<Instruction, OnreError> {
-    require_token_program(onyc_token_program)?;
-    require_token_program(asset_token_program)?;
-
-    let offer = pda(&[SEED_OFFER, asset_mint.as_ref(), onyc_mint.as_ref()]);
-    if quote.offer != offer
-        || quote.token_in_mint != *onyc_mint
-        || quote.token_out_mint != *asset_mint
-    {
-        return Err(OnreError::QuoteMismatch);
-    }
-    if quote.token_in_amount > 0 && quote.minimum_out == 0 {
-        return Err(OnreError::InvalidMinimumOut);
-    }
-
-    let pair_state = pda(&[SEED_PROP_AMM_PAIR_STATE, offer.as_ref()]);
-    let redemption_offer = pda(&[
-        SEED_REDEMPTION_OFFER,
-        onyc_mint.as_ref(),
-        asset_mint.as_ref(),
-    ]);
-    let state = pda(&[SEED_STATE]);
-    let offer_vault_authority = pda(&[SEED_OFFER_VAULT_AUTHORITY]);
-    let redemption_vault_authority = pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]);
-    let prop_amm_proceeds_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PROP_AMM_PROCEEDS_VAULT]);
-    let prop_amm_sell_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PROP_AMM_SELL_FEE_VAULT]);
-    let mint_authority = pda(&[SEED_MINT_AUTHORITY]);
-    let buffer_state = pda(&[SEED_BUFFER_STATE]);
-    let reserve_vault_authority = pda(&[SEED_RESERVE_VAULT_AUTHORITY]);
-    let management_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_MANAGEMENT_FEE_VAULT]);
-    let performance_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERFORMANCE_FEE_VAULT]);
-    let market_stats = pda(&[SEED_MARKET_STATS]);
-    let excluded_balance = pda(&[SEED_CIRCULATING_SUPPLY_EXCLUDED_BALANCE]);
-
-    let mut data = Vec::with_capacity(24);
-    data.extend_from_slice(&OPEN_SWAP_SELL_DISCRIMINATOR);
-    data.extend_from_slice(&quote.token_in_amount.to_le_bytes());
-    data.extend_from_slice(&quote.minimum_out.to_le_bytes());
-
-    Ok(Instruction {
-        program_id: ONRE_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new(offer, false),
-            AccountMeta::new(pair_state, false),
-            AccountMeta::new_readonly(redemption_offer, false),
-            AccountMeta::new_readonly(state, false),
-            AccountMeta::new_readonly(offer_vault_authority, false),
-            AccountMeta::new_readonly(redemption_vault_authority, false),
-            AccountMeta::new(
-                ata(&redemption_vault_authority, onyc_mint, onyc_token_program),
-                false,
-            ),
-            AccountMeta::new(
-                ata(&redemption_vault_authority, asset_mint, asset_token_program),
-                false,
-            ),
-            AccountMeta::new(*onyc_mint, false),
-            AccountMeta::new_readonly(*onyc_token_program, false),
-            AccountMeta::new(*asset_mint, false),
-            AccountMeta::new_readonly(*asset_token_program, false),
-            AccountMeta::new(ata(user, onyc_mint, onyc_token_program), false),
-            AccountMeta::new(ata(user, asset_mint, asset_token_program), false),
-            AccountMeta::new(prop_amm_proceeds_vault, false),
-            AccountMeta::new(
-                ata(&prop_amm_proceeds_vault, onyc_mint, onyc_token_program),
-                false,
-            ),
-            AccountMeta::new(prop_amm_sell_fee_vault, false),
-            AccountMeta::new(
-                ata(&prop_amm_sell_fee_vault, onyc_mint, onyc_token_program),
-                false,
-            ),
-            AccountMeta::new_readonly(mint_authority, false),
-            AccountMeta::new(buffer_state, false),
-            AccountMeta::new(
-                ata(&reserve_vault_authority, onyc_mint, onyc_token_program),
-                false,
-            ),
-            AccountMeta::new(
-                ata(&management_fee_vault, onyc_mint, onyc_token_program),
-                false,
-            ),
-            AccountMeta::new(
-                ata(&performance_fee_vault, onyc_mint, onyc_token_program),
-                false,
-            ),
-            AccountMeta::new(market_stats, false),
-            AccountMeta::new_readonly(excluded_balance, false),
-            AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS, false),
-            AccountMeta::new(*user, true),
-            AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
-            AccountMeta::new_readonly(*state_main_offer, false),
-            AccountMeta::new_readonly(
-                ata(&offer_vault_authority, onyc_mint, onyc_token_program),
-                false,
-            ),
-        ],
-        data,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn serialized_quote(
-        offer: Pubkey,
-        onyc_mint: Pubkey,
-        asset_mint: Pubkey,
-        input: u64,
-        minimum_out: u64,
-    ) -> Vec<u8> {
-        let mut data = Vec::with_capacity(SWAP_QUOTE_SERIALIZED_LEN);
-        data.extend_from_slice(offer.as_ref());
-        data.extend_from_slice(onyc_mint.as_ref());
-        data.extend_from_slice(asset_mint.as_ref());
-        data.extend_from_slice(&input.to_le_bytes());
-        data.extend_from_slice(&(input - 20).to_le_bytes());
-        data.extend_from_slice(&20u64.to_le_bytes());
-        data.extend_from_slice(&(minimum_out + 10).to_le_bytes());
-        data.extend_from_slice(&minimum_out.to_le_bytes());
-        data.extend_from_slice(&1_010_000_000u64.to_le_bytes());
-        data.extend_from_slice(&123i64.to_le_bytes());
-        assert_eq!(data.len(), SWAP_QUOTE_SERIALIZED_LEN);
-        data
+    fn serialized_pair_state(offer: Pubkey, asset: Pubkey, onyc: Pubkey) -> Vec<u8> {
+        let mut d = PROP_AMM_PAIR_STATE_ACCOUNT_DISCRIMINATOR.to_vec();
+        d.extend_from_slice(offer.as_ref());
+        d.extend_from_slice(asset.as_ref());
+        d.extend_from_slice(onyc.as_ref());
+        d.push(1); // enabled
+        d.extend_from_slice(&700u16.to_le_bytes()); // curve_peg_haircut_bps
+        d.extend_from_slice(&25_000u32.to_le_bytes()); // curve_exponent_scaled
+        d.extend_from_slice(&20u32.to_le_bytes()); // cadence_threshold
+        d.extend_from_slice(&10_000u32.to_le_bytes()); // cadence_wave_scaled
+        d.extend_from_slice(&86_400i64.to_le_bytes()); // epoch_duration_seconds
+        d.extend_from_slice(&20_000u32.to_le_bytes()); // wall_sensitivity_scaled
+        d.extend_from_slice(&5_000_000_000u64.to_le_bytes()); // minimum_sell_haircut_onyc
+        d.extend_from_slice(&11u64.to_le_bytes()); // curr_sell_value_stable
+        d.extend_from_slice(&22u64.to_le_bytes()); // curr_buy_value_stable
+        d.extend_from_slice(&33u64.to_le_bytes()); // prev_net_sell_value_stable
+        d.extend_from_slice(&4u32.to_le_bytes()); // curr_sell_trade_count
+        d.extend_from_slice(&123i64.to_le_bytes()); // epoch_start
+        d.push(254); // bump
+        d.extend_from_slice(&[0u8; PROP_AMM_PAIR_STATE_RESERVED_BYTES]); // reserved
+        assert_eq!(
+            d.len(),
+            ANCHOR_DISCRIMINATOR_LEN + PROP_AMM_PAIR_STATE_SERIALIZED_LEN
+        );
+        d
     }
 
     #[test]
-    fn quote_sell_instruction_matches_v5_idl() {
-        let onyc = Pubkey::new_unique();
+    fn pair_state_load_matches_v5_layout() {
+        let offer = Pubkey::new_unique();
         let asset = Pubkey::new_unique();
-        let ix = build_quote_swap_sell_instruction(&onyc, &asset, &TOKEN_PROGRAM, 1_000).unwrap();
+        let onyc = Pubkey::new_unique();
+        let state = PropAmmPairState::load(&serialized_pair_state(offer, asset, onyc)).unwrap();
 
-        let offer = pda(&[SEED_OFFER, asset.as_ref(), onyc.as_ref()]);
-        let expected_keys = [
-            offer,
-            pda(&[SEED_PROP_AMM_PAIR_STATE, offer.as_ref()]),
-            pda(&[SEED_REDEMPTION_OFFER, onyc.as_ref(), asset.as_ref()]),
-            pda(&[SEED_STATE]),
-            pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]),
-            ata(
-                &pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]),
-                &asset,
-                &TOKEN_PROGRAM,
-            ),
-            onyc,
-            asset,
-            TOKEN_PROGRAM,
-            pda(&[SEED_MARKET_STATS]),
-        ];
-        assert_eq!(ix.accounts.len(), expected_keys.len());
-        for (meta, expected) in ix.accounts.iter().zip(expected_keys) {
-            assert_eq!(meta.pubkey, expected);
-            assert!(!meta.is_writable);
-            assert!(!meta.is_signer);
-        }
-        let mut expected_data = QUOTE_SWAP_SELL_DISCRIMINATOR.to_vec();
-        expected_data.extend_from_slice(&1_000u64.to_le_bytes());
-        assert_eq!(ix.data, expected_data);
+        assert_eq!(state.offer, offer);
+        assert_eq!(state.asset_mint, asset);
+        assert_eq!(state.onyc_mint, onyc);
+        assert!(state.enabled);
+        assert_eq!(state.curve_peg_haircut_bps, 700);
+        assert_eq!(state.curve_exponent_scaled, 25_000);
+        assert_eq!(state.cadence_threshold, 20);
+        assert_eq!(state.cadence_wave_scaled, 10_000);
+        assert_eq!(state.epoch_duration_seconds, 86_400);
+        assert_eq!(state.wall_sensitivity_scaled, 20_000);
+        assert_eq!(state.minimum_sell_haircut_onyc, 5_000_000_000);
+        assert_eq!(state.curr_sell_value_stable, 11);
+        assert_eq!(state.curr_buy_value_stable, 22);
+        assert_eq!(state.prev_net_sell_value_stable, 33);
+        assert_eq!(state.curr_sell_trade_count, 4);
+        assert_eq!(state.epoch_start, 123);
+        assert_eq!(state.bump, 254);
     }
 
     #[test]
-    fn quote_parser_binds_return_data_to_request() {
-        let onyc = Pubkey::new_unique();
-        let asset = Pubkey::new_unique();
-        let offer = pda(&[SEED_OFFER, asset.as_ref(), onyc.as_ref()]);
-        let data = serialized_quote(offer, onyc, asset, 1_000, 970);
-
-        let quote = parse_swap_sell_quote(&ONRE_PROGRAM_ID, &data, &onyc, &asset, 1_000).unwrap();
-        assert_eq!(quote.token_in_fee_amount, 20);
-        assert_eq!(quote.minimum_out, 970);
-        assert_eq!(quote.quoted_at, 123);
-
-        assert!(matches!(
-            parse_swap_sell_quote(&Pubkey::new_unique(), &data, &onyc, &asset, 1_000),
-            Err(OnreError::InvalidQuoteProgram { .. })
-        ));
-        assert!(matches!(
-            parse_swap_sell_quote(&ONRE_PROGRAM_ID, &data[..151], &onyc, &asset, 1_000),
-            Err(OnreError::InvalidQuoteLength { .. })
-        ));
-        assert!(matches!(
-            parse_swap_sell_quote(&ONRE_PROGRAM_ID, &data, &onyc, &asset, 999),
-            Err(OnreError::QuoteMismatch)
-        ));
-    }
-
-    #[test]
-    fn open_sell_instruction_matches_v5_idl_shape() {
-        let user = Pubkey::new_unique();
-        let onyc = Pubkey::new_unique();
-        let asset = Pubkey::new_unique();
-        let main_offer = Pubkey::new_unique();
-        let offer = pda(&[SEED_OFFER, asset.as_ref(), onyc.as_ref()]);
-        let quote = parse_swap_sell_quote(
-            &ONRE_PROGRAM_ID,
-            &serialized_quote(offer, onyc, asset, 1_000, 970),
-            &onyc,
-            &asset,
-            1_000,
-        )
+    fn dampening_state_maps_from_pair_state() {
+        let state = PropAmmPairState::load(&serialized_pair_state(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ))
         .unwrap();
 
-        let ix = build_open_swap_sell_instruction(
-            &user,
-            &onyc,
-            &asset,
-            &TOKEN_PROGRAM,
-            &TOKEN_PROGRAM,
-            &main_offer,
-            &quote,
-        )
-        .unwrap();
-        assert_eq!(ix.accounts.len(), 31);
-        assert_eq!(ix.accounts[0].pubkey, offer);
-        assert_eq!(
-            ix.accounts[1].pubkey,
-            pda(&[SEED_PROP_AMM_PAIR_STATE, offer.as_ref()])
-        );
-        assert_eq!(
-            ix.accounts[2].pubkey,
-            pda(&[SEED_REDEMPTION_OFFER, onyc.as_ref(), asset.as_ref()])
-        );
-        assert_eq!(ix.accounts[8].pubkey, onyc);
-        assert_eq!(ix.accounts[10].pubkey, asset);
-        assert_eq!(ix.accounts[26].pubkey, user);
-        assert!(ix.accounts[26].is_signer);
-        assert_eq!(ix.accounts[29].pubkey, main_offer);
-        assert_eq!(
-            ix.accounts[30].pubkey,
-            ata(&pda(&[SEED_OFFER_VAULT_AUTHORITY]), &onyc, &TOKEN_PROGRAM)
-        );
-        let mut expected_data = OPEN_SWAP_SELL_DISCRIMINATOR.to_vec();
-        expected_data.extend_from_slice(&1_000u64.to_le_bytes());
-        expected_data.extend_from_slice(&970u64.to_le_bytes());
-        assert_eq!(ix.data, expected_data);
+        let dampening: onre_pricing::types::DampeningState = state.to_dampening_state();
+        assert_eq!(dampening.max_haircut_bps, 700);
+        assert_eq!(dampening.exponent_scaled, 25_000);
+        assert_eq!(dampening.cadence_threshold, 20);
+        assert_eq!(dampening.cadence_wave_scaled, 10_000);
+        assert_eq!(dampening.wall_sensitivity_scaled, 20_000);
+        assert_eq!(dampening.epoch_start, 123); // i64 -> u64
+        assert_eq!(dampening.epoch_duration_seconds, 86_400); // i64 -> u64
+        assert_eq!(dampening.sell_volume, 11);
+        assert_eq!(dampening.buy_volume, 22);
+        assert_eq!(dampening.sell_trade_count, 4);
+        assert_eq!(dampening.prev_net_sell_volume, 33);
+
+        assert_eq!(state.min_sell_fee(), 5_000_000_000);
     }
 
     #[test]
-    fn positive_sell_rejects_zero_minimum_out() {
-        let onyc = Pubkey::new_unique();
-        let asset = Pubkey::new_unique();
-        let offer = pda(&[SEED_OFFER, asset.as_ref(), onyc.as_ref()]);
-        let data = serialized_quote(offer, onyc, asset, 1_000, 0);
+    fn pair_state_load_rejects_bad_input() {
+        let data = serialized_pair_state(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+
         assert!(matches!(
-            parse_swap_sell_quote(&ONRE_PROGRAM_ID, &data, &onyc, &asset, 1_000),
-            Err(OnreError::InvalidMinimumOut)
+            PropAmmPairState::load(&data[..data.len() - 1]),
+            Err(OnreError::DeserializationFailed(_))
+        ));
+
+        let mut wrong_disc = data.clone();
+        wrong_disc[0] ^= 0xff;
+        assert!(matches!(
+            PropAmmPairState::load(&wrong_disc),
+            Err(OnreError::DeserializationFailed(_))
         ));
     }
 }

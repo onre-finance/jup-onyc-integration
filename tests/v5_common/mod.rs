@@ -214,6 +214,29 @@ pub fn create_market_stats(svm: &mut LiteSVM) -> Pubkey {
     market_stats
 }
 
+pub fn create_circulating_supply_excluded_balance(svm: &mut LiteSVM) -> Pubkey {
+    let (key, bump) = Pubkey::find_program_address(
+        &[SEED_CIRCULATING_SUPPLY_EXCLUDED_BALANCE],
+        &ONRE_PROGRAM_ID,
+    );
+    // 8 (disc) + 8 (amount) + 8 (last_updated_at) + 8 (last_updated_slot) + 1 (bump) + 31 (reserved)
+    let mut data = vec![0u8; 64];
+    data[..8].copy_from_slice(&CIRCULATING_SUPPLY_EXCLUDED_BALANCE_ACCOUNT_DISCRIMINATOR);
+    data[32] = bump;
+    svm.set_account(
+        key,
+        Account {
+            lamports: INITIAL_LAMPORTS,
+            data,
+            owner: ONRE_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    key
+}
+
 // ===========================================================================
 // Test-side admin instruction builders (setup only)
 // ===========================================================================
@@ -556,21 +579,31 @@ impl MintOfferCtx {
         let mut venue = OnreVenue::from_account(&self.offer_pda, &offer_account)
             .expect("failed to load venue from offer account");
 
-        let cache = SnapshotCache::from_svm(
-            &self.svm,
-            &[
-                self.offer_pda,
-                pda(&[SEED_STATE]),
-                self.usdc_mint,
-                self.onyc_mint,
-            ],
-        );
+        let keys = venue.get_required_pubkeys_for_update().unwrap();
+        let cache = SnapshotCache::from_svm(&self.svm, &keys);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         rt.block_on(venue.update_state(&cache))
             .expect("update_state failed");
         venue
+    }
+
+    /// Sets up sell-side accounts with zero-fee defaults so that `load_venue`
+    /// / `update_state` can find all required accounts.
+    pub fn setup_sell_side_defaults(&mut self) {
+        self.setup_redemption_offer();
+        let boss = self.payer.insecure_clone();
+        let ix = build_configure_prop_amm_ix(&boss.pubkey(), &self.usdc_mint, &self.onyc_mint);
+        self.send_ixs(&[ix], &[&boss])
+            .expect("configure_prop_amm failed");
+        let redemption_vault_authority = pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]);
+        create_token_account(
+            &mut self.svm,
+            &self.usdc_mint,
+            &redemption_vault_authority,
+            0,
+        );
     }
 
     /// Creates the ONyc -> USDC redemption offer (boss-signed).
@@ -608,22 +641,17 @@ pub fn custom_error_code(failure: &FailedTransactionMetadata) -> Option<u32> {
     }
 }
 
-pub fn setup_mint_offer() -> MintOfferCtx {
-    setup_mint_offer_with_fee(0)
-}
-
-/// Sets both fee lanes to the same value for tests that only care about the
-/// aggregate permissionless execution result.
-pub fn setup_mint_offer_with_fee(fee_basis_points: u16) -> MintOfferCtx {
-    setup_mint_offer_with_fees(fee_basis_points, fee_basis_points)
-}
-
-/// Full v5 environment: initialized state, USDC -> ONyc permissionless offer
-/// (price 1.0, apr 0), main offer set, vault/permissionless ATAs seeded and a
-/// funded user.
-pub fn setup_mint_offer_with_fees(
+/// Full v5 environment: initialized state, USDC -> ONyc permissionless offer,
+/// main offer set, vault/permissionless ATAs seeded and a funded user.
+///
+/// The pricing vector uses `base_time == start_time == now` with a 1-day
+/// `price_fix_duration`, so on-chain and off-chain quotes both land in step 0
+/// (constant price) for any `apr`, keeping the tests deterministic.
+pub fn setup_mint_offer_with_pricing(
     fee_basis_points: u16,
     fee_basis_points_permissionless: u16,
+    base_price: u64,
+    apr: u64,
 ) -> MintOfferCtx {
     let mut svm = LiteSVM::new().with_precompiles();
     let payer = Keypair::new();
@@ -666,6 +694,8 @@ pub fn setup_mint_offer_with_fees(
     let ix = build_make_offer_ix(&boss, &usdc_mint, &onyc_mint, fee_basis_points);
     ctx.send_ixs(&[ix], &[&boss_kp]).expect("make_offer failed");
 
+    // The permissionless v2 take charges the permissionless fee (a field distinct
+    // from make_offer's regular fee), so configure it to match the scenario.
     let ix = build_update_offer_permissionless_fee_ix(
         &boss,
         &usdc_mint,
@@ -680,14 +710,7 @@ pub fn setup_mint_offer_with_fees(
         .expect("set_main_offer failed");
 
     let ix = build_add_offer_vector_ix(
-        &boss,
-        &usdc_mint,
-        &onyc_mint,
-        now,
-        now,
-        1_000_000_000, // price 1.0
-        0,             // apr 0 -> price constant across the clock skew window
-        86_400,
+        &boss, &usdc_mint, &onyc_mint, now, now, base_price, apr, 86_400,
     );
     ctx.send_ixs(&[ix], &[&boss_kp])
         .expect("add_offer_vector failed");
@@ -712,10 +735,120 @@ pub fn setup_mint_offer_with_fees(
 
     create_token_account(&mut ctx.svm, &usdc_mint, &boss, 0);
 
+    create_circulating_supply_excluded_balance(&mut ctx.svm);
+
     let user_pk = ctx.user.pubkey();
     ctx.svm.airdrop(&user_pk, 10 * INITIAL_LAMPORTS).unwrap();
     create_token_account(&mut ctx.svm, &usdc_mint, &user_pk, USER_USDC_BALANCE);
     create_token_account(&mut ctx.svm, &onyc_mint, &user_pk, 0);
 
     ctx
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_open_swap_sell_instruction(
+    user: &Pubkey,
+    onyc_mint: &Pubkey,
+    asset_mint: &Pubkey,
+    onyc_token_program: &Pubkey,
+    asset_token_program: &Pubkey,
+    state_main_offer: &Pubkey,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<Instruction, OnreError> {
+    fn ata(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
+        get_associated_token_address_with_program_id(owner, mint, token_program)
+    }
+
+    let offer = pda(&[SEED_OFFER, asset_mint.as_ref(), onyc_mint.as_ref()]);
+
+    if amount_in > 0 && minimum_amount_out == 0 {
+        return Err(OnreError::InvalidMinimumOut);
+    }
+
+    let pair_state = pda(&[SEED_PROP_AMM_PAIR_STATE, offer.as_ref()]);
+    let redemption_offer = pda(&[
+        SEED_REDEMPTION_OFFER,
+        onyc_mint.as_ref(),
+        asset_mint.as_ref(),
+    ]);
+    let state = pda(&[SEED_STATE]);
+    let offer_vault_authority = pda(&[SEED_OFFER_VAULT_AUTHORITY]);
+    let redemption_vault_authority = pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]);
+    let prop_amm_proceeds_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PROP_AMM_PROCEEDS_VAULT]);
+    let prop_amm_sell_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PROP_AMM_SELL_FEE_VAULT]);
+    let mint_authority = pda(&[SEED_MINT_AUTHORITY]);
+    let buffer_state = pda(&[SEED_BUFFER_STATE]);
+    let reserve_vault_authority = pda(&[SEED_RESERVE_VAULT_AUTHORITY]);
+    let management_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_MANAGEMENT_FEE_VAULT]);
+    let performance_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERFORMANCE_FEE_VAULT]);
+    let market_stats = pda(&[SEED_MARKET_STATS]);
+    let excluded_balance = pda(&[SEED_CIRCULATING_SUPPLY_EXCLUDED_BALANCE]);
+
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&OPEN_SWAP_SELL_DISCRIMINATOR);
+    data.extend_from_slice(&amount_in.to_le_bytes());
+    data.extend_from_slice(&minimum_amount_out.to_le_bytes());
+
+    Ok(Instruction {
+        program_id: ONRE_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(offer, false),
+            AccountMeta::new(pair_state, false),
+            AccountMeta::new_readonly(redemption_offer, false),
+            AccountMeta::new_readonly(state, false),
+            AccountMeta::new_readonly(offer_vault_authority, false),
+            AccountMeta::new_readonly(redemption_vault_authority, false),
+            AccountMeta::new(
+                ata(&redemption_vault_authority, onyc_mint, onyc_token_program),
+                false,
+            ),
+            AccountMeta::new(
+                ata(&redemption_vault_authority, asset_mint, asset_token_program),
+                false,
+            ),
+            AccountMeta::new(*onyc_mint, false),
+            AccountMeta::new_readonly(*onyc_token_program, false),
+            AccountMeta::new(*asset_mint, false),
+            AccountMeta::new_readonly(*asset_token_program, false),
+            AccountMeta::new(ata(user, onyc_mint, onyc_token_program), false),
+            AccountMeta::new(ata(user, asset_mint, asset_token_program), false),
+            AccountMeta::new(prop_amm_proceeds_vault, false),
+            AccountMeta::new(
+                ata(&prop_amm_proceeds_vault, onyc_mint, onyc_token_program),
+                false,
+            ),
+            AccountMeta::new(prop_amm_sell_fee_vault, false),
+            AccountMeta::new(
+                ata(&prop_amm_sell_fee_vault, onyc_mint, onyc_token_program),
+                false,
+            ),
+            AccountMeta::new_readonly(mint_authority, false),
+            AccountMeta::new(buffer_state, false),
+            AccountMeta::new(
+                ata(&reserve_vault_authority, onyc_mint, onyc_token_program),
+                false,
+            ),
+            AccountMeta::new(
+                ata(&management_fee_vault, onyc_mint, onyc_token_program),
+                false,
+            ),
+            AccountMeta::new(
+                ata(&performance_fee_vault, onyc_mint, onyc_token_program),
+                false,
+            ),
+            AccountMeta::new(market_stats, false),
+            AccountMeta::new_readonly(excluded_balance, false),
+            AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS, false),
+            AccountMeta::new(*user, true),
+            AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+            AccountMeta::new_readonly(*state_main_offer, false),
+            AccountMeta::new_readonly(
+                ata(&offer_vault_authority, onyc_mint, onyc_token_program),
+                false,
+            ),
+        ],
+        data,
+    })
 }

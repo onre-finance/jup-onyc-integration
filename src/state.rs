@@ -4,10 +4,11 @@ use bytemuck::{Pod, Zeroable};
 use solana_pubkey::Pubkey;
 
 use crate::constants::{
-    ANCHOR_DISCRIMINATOR_LEN, MAX_VECTORS, OFFER_ACCOUNT_DISCRIMINATOR, STATE_ACCOUNT_DISCRIMINATOR,
+    ANCHOR_DISCRIMINATOR_LEN, CIRCULATING_SUPPLY_EXCLUDED_BALANCE_ACCOUNT_DISCRIMINATOR,
+    MAX_VECTORS, OFFER_ACCOUNT_DISCRIMINATOR, STATE_ACCOUNT_DISCRIMINATOR,
 };
 use crate::errors::OnreError;
-use crate::util::{read_pubkey, read_u64};
+use crate::util::{read_i64, read_pubkey, read_u64};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -68,6 +69,18 @@ pub struct OfferVector {
     pub base_price: u64,
     pub apr: u64,
     pub price_fix_duration: u64,
+}
+
+impl From<OfferVector> for onre_pricing::PriceVector {
+    fn from(value: OfferVector) -> Self {
+        onre_pricing::PriceVector {
+            start_time: value.start_time,
+            base_time: value.base_time,
+            base_price: value.base_price,
+            apr: value.apr,
+            price_fix_duration: value.price_fix_duration,
+        }
+    }
 }
 
 const MAX_ADMINS: usize = 20;
@@ -131,6 +144,44 @@ impl State {
 
     pub fn is_killed(&self) -> bool {
         self.is_killed != 0
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct CirculatingSupplyExcludedBalance {
+    pub amount: u64,
+    pub last_updated_at: i64,
+    pub last_updated_slot: u64,
+    pub bump: u8,
+    pub reserved: [u8; 31],
+}
+
+const CIRCULATING_SUPPLY_EXCLUDED_BALANCE_SERIALIZED_LEN: usize = 8 + 8 + 8 + 1 + 31;
+
+impl CirculatingSupplyExcludedBalance {
+    pub fn load(data: &[u8]) -> Result<Self, OnreError> {
+        let expected_size =
+            ANCHOR_DISCRIMINATOR_LEN + CIRCULATING_SUPPLY_EXCLUDED_BALANCE_SERIALIZED_LEN;
+        if data.len() < expected_size {
+            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+        }
+        if data[..ANCHOR_DISCRIMINATOR_LEN]
+            != CIRCULATING_SUPPLY_EXCLUDED_BALANCE_ACCOUNT_DISCRIMINATOR
+        {
+            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+        }
+        let d = &data[ANCHOR_DISCRIMINATOR_LEN..];
+
+        let mut reserved = [0u8; 31];
+        reserved.copy_from_slice(&d[25..56]);
+
+        Ok(Self {
+            amount: read_u64(d, 0),
+            last_updated_at: read_i64(d, 8),
+            last_updated_slot: read_u64(d, 16),
+            bump: d[24],
+            reserved,
+        })
     }
 }
 
