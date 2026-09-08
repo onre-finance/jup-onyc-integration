@@ -35,18 +35,6 @@ pub const SEED_PROP_AMM_PAIR_STATE: &[u8] = b"prop_amm_pair";
 pub const SEED_PROP_AMM_PROCEEDS_VAULT: &[u8] = b"prop_amm_proceeds";
 pub const SEED_PROP_AMM_SELL_FEE_VAULT: &[u8] = b"prop_amm_sell_fee";
 
-// Price decimals
-pub const PRICE_DECIMALS: u8 = 9;
-
-// Maximum basis points (100%)
-pub const MAX_BASIS_POINTS: u128 = 10000;
-
-// Seconds in a year for APR calculations
-pub const SECONDS_IN_YEAR: u128 = 31_536_000;
-
-// APR scale factor: 1_000_000 = 100%, so 1% = 10,000, 5% = 50,000
-pub const APR_SCALE: u128 = 1_000_000;
-
 // Maximum number of pricing vectors per offer
 pub const MAX_VECTORS: usize = 10;
 
@@ -58,6 +46,9 @@ pub const OFFER_ACCOUNT_DISCRIMINATOR: [u8; 8] = [215, 88, 60, 71, 170, 162, 73,
 pub const STATE_ACCOUNT_DISCRIMINATOR: [u8; 8] = [216, 146, 107, 94, 104, 75, 182, 177];
 pub const REDEMPTION_OFFER_ACCOUNT_DISCRIMINATOR: [u8; 8] = [170, 229, 178, 15, 184, 107, 140, 41];
 pub const REDEMPTION_REQUEST_ACCOUNT_DISCRIMINATOR: [u8; 8] = [117, 157, 214, 214, 64, 160, 31, 58];
+pub const PROP_AMM_PAIR_STATE_ACCOUNT_DISCRIMINATOR: [u8; 8] = [83, 138, 171, 182, 7, 98, 212, 149];
+pub const CIRCULATING_SUPPLY_EXCLUDED_BALANCE_ACCOUNT_DISCRIMINATOR: [u8; 8] =
+    [148, 113, 150, 192, 170, 44, 10, 140];
 
 // Instruction discriminator for take_offer_permissionless
 pub const TAKE_OFFER_PERMISSIONLESS_DISCRIMINATOR: [u8; 8] = [37, 190, 224, 77, 197, 39, 203, 230];

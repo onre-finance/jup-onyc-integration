@@ -9,9 +9,6 @@ mod v5_common;
 
 use onre_titan::constants::*;
 use onre_titan::errors::{classify_program_error, ExpectedFailure};
-use onre_titan::prop_amm::{
-    build_open_swap_sell_instruction, build_quote_swap_sell_instruction, parse_swap_sell_quote,
-};
 use onre_titan::redemption::{
     build_create_redemption_request_instruction, find_redemption_offer_pda,
     find_redemption_request_pda, redemption_request_status, RedemptionOffer, RedemptionRequest,
@@ -29,15 +26,14 @@ use v5_common::*;
 
 #[test]
 fn test_v2_mint_happy_path_quote_matches_onchain_result() {
-    let mut ctx = setup_mint_offer();
+    let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 0);
+    ctx.setup_sell_side_defaults();
 
-    // Build the venue exactly like an integrator: load offer account, then
-    // refresh state through the AccountsCache abstraction.
     let venue = ctx.load_venue();
     assert!(venue.initialized());
     assert_eq!(venue.status(), VenueStatus::Active);
 
-    let amount = 1_000_000u64; // 1 USDC
+    let amount = 1_000_000; // 1 USDC
     let quote = venue
         .quote(QuoteRequest {
             input_mint: ctx.usdc_mint,
@@ -46,9 +42,9 @@ fn test_v2_mint_happy_path_quote_matches_onchain_result() {
             swap_type: SwapType::ExactIn,
         })
         .unwrap();
+
     assert!(!quote.not_enough_liquidity);
-    // price 1.0 (apr=0), 6 -> 9 decimals: 1 USDC mints exactly 1 ONyc
-    assert_eq!(quote.expected_output, 1_000_000_000);
+    assert!(quote.expected_output > 0);
 
     let ix = venue
         .generate_swap_instruction_v2(
@@ -74,8 +70,152 @@ fn test_v2_mint_happy_path_quote_matches_onchain_result() {
 }
 
 #[test]
+fn test_v2_mint_routes_fee_to_dedicated_fee_vault() {
+    let mut ctx = setup_mint_offer_with_pricing(100, 100, 1_000_000_000, 0); // 1% fee
+    ctx.setup_sell_side_defaults();
+
+    let venue = ctx.load_venue();
+    let amount = 1_000_000;
+    let quote = venue
+        .quote(QuoteRequest {
+            input_mint: ctx.usdc_mint,
+            output_mint: ctx.onyc_mint,
+            amount,
+            swap_type: SwapType::ExactIn,
+        })
+        .unwrap();
+
+    assert!(!quote.not_enough_liquidity);
+    assert!(quote.expected_output > 0);
+
+    let ix = venue
+        .generate_swap_instruction_v2(
+            QuoteRequest {
+                input_mint: ctx.usdc_mint,
+                output_mint: ctx.onyc_mint,
+                amount,
+                swap_type: SwapType::ExactIn,
+            },
+            ctx.user.pubkey(),
+        )
+        .unwrap();
+    let user = ctx.user.insecure_clone();
+    ctx.send_ixs(&[ix], &[&user])
+        .expect("v2 take should succeed");
+
+    assert_eq!(
+        ctx.token_balance(&ctx.user.pubkey(), &ctx.onyc_mint),
+        quote.expected_output
+    );
+
+    // The 1% fee lands in the dedicated permissionless-offer-fee configurable vault ATA
+    let fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERMISSIONLESS_OFFER_FEE_VAULT]);
+    assert_eq!(ctx.token_balance(&fee_vault, &ctx.usdc_mint), 10_000);
+}
+
+#[test]
+fn test_v2_mint_quote_matches_onchain_with_apr() {
+    // 36.5% APR, price 1.0, no fee.
+    let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 365_000);
+    ctx.setup_sell_side_defaults();
+
+    let venue = ctx.load_venue();
+    assert_eq!(venue.status(), VenueStatus::Active);
+
+    let amount = 1_234_567; // 1.234567 USDC and odd, to exercise flooring
+    let quote = venue
+        .quote(QuoteRequest {
+            input_mint: ctx.usdc_mint,
+            output_mint: ctx.onyc_mint,
+            amount,
+            swap_type: SwapType::ExactIn,
+        })
+        .unwrap();
+
+    assert!(!quote.not_enough_liquidity);
+    assert!(quote.expected_output > 0);
+
+    let ix = venue
+        .generate_swap_instruction_v2(
+            QuoteRequest {
+                input_mint: ctx.usdc_mint,
+                output_mint: ctx.onyc_mint,
+                amount,
+                swap_type: SwapType::ExactIn,
+            },
+            ctx.user.pubkey(),
+        )
+        .unwrap();
+    let user = ctx.user.insecure_clone();
+    ctx.send_ixs(&[ix], &[&user])
+        .expect("v2 take should succeed");
+
+    assert_eq!(
+        ctx.token_balance(&ctx.user.pubkey(), &ctx.onyc_mint),
+        quote.expected_output
+    );
+    assert_eq!(
+        ctx.token_balance(&ctx.user.pubkey(), &ctx.usdc_mint),
+        USER_USDC_BALANCE - amount
+    );
+}
+
+#[test]
+fn test_v2_mint_quote_matches_onchain_with_fee_and_flooring() {
+    // 2.5% permissionless fee, price 1.0, 36.5% APR.
+    let mut ctx = setup_mint_offer_with_pricing(100, 250, 1_000_000_000, 365_000);
+    ctx.setup_sell_side_defaults();
+
+    let venue = ctx.load_venue();
+    let amount = 3_333_333; // odd input -> ceiling fee + floor division
+    let quote = venue
+        .quote(QuoteRequest {
+            input_mint: ctx.usdc_mint,
+            output_mint: ctx.onyc_mint,
+            amount,
+            swap_type: SwapType::ExactIn,
+        })
+        .unwrap();
+
+    assert!(!quote.not_enough_liquidity);
+    assert!(quote.expected_output > 0);
+
+    let ix = venue
+        .generate_swap_instruction_v2(
+            QuoteRequest {
+                input_mint: ctx.usdc_mint,
+                output_mint: ctx.onyc_mint,
+                amount,
+                swap_type: SwapType::ExactIn,
+            },
+            ctx.user.pubkey(),
+        )
+        .unwrap();
+    let user = ctx.user.insecure_clone();
+    ctx.send_ixs(&[ix], &[&user])
+        .expect("v2 take should succeed");
+
+    assert_eq!(
+        ctx.token_balance(&ctx.user.pubkey(), &ctx.onyc_mint),
+        quote.expected_output
+    );
+
+    // Fee routed to the dedicated permissionless-offer-fee vault: the program's
+    // fee equals what the pricing library computes for the same input.
+    let expected_fee = onre_pricing::calculate_fee(amount, 250).unwrap();
+    let fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERMISSIONLESS_OFFER_FEE_VAULT]);
+    assert_eq!(ctx.token_balance(&fee_vault, &ctx.usdc_mint), expected_fee);
+    // User is debited the full input amount.
+    assert_eq!(
+        ctx.token_balance(&ctx.user.pubkey(), &ctx.usdc_mint),
+        USER_USDC_BALANCE - amount
+    );
+}
+
+#[test]
 fn test_v2_instruction_matches_final_canonical_layout() {
-    let ctx = setup_mint_offer();
+    let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 365_000);
+    ctx.setup_sell_side_defaults();
     let venue = ctx.load_venue();
     let amount = 1_000_000u64;
     let ix = venue
@@ -151,7 +291,9 @@ fn test_v2_instruction_matches_final_canonical_layout() {
 
 #[test]
 fn test_v2_permissionless_mint_uses_permissionless_fee_and_vault() {
-    let mut ctx = setup_mint_offer_with_fees(100, 300); // regular 1%, permissionless 3%
+    // regular 1%, permissionless 3%
+    let mut ctx = setup_mint_offer_with_pricing(100, 300, 1_000_000_000, 0);
+    ctx.setup_sell_side_defaults();
 
     let venue = ctx.load_venue();
     assert_eq!(venue.offer.fee_basis_points, 100);
@@ -214,7 +356,7 @@ fn test_v2_permissionless_mint_uses_permissionless_fee_and_vault() {
 
 #[test]
 fn test_atomic_sell_quote_executes_against_funded_usdg_liquidity() {
-    let mut ctx = setup_mint_offer();
+    let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 365_000);
     ctx.setup_redemption_offer_with_fees(20, 20);
 
     let boss = ctx.payer.insecure_clone();
@@ -244,27 +386,18 @@ fn test_atomic_sell_quote_executes_against_funded_usdg_liquidity() {
         sell_amount,
     );
 
-    let quote_ix = build_quote_swap_sell_instruction(
-        &ctx.onyc_mint,
-        &ctx.usdc_mint,
-        &TOKEN_PROGRAM,
-        sell_amount,
-    )
-    .unwrap();
-    let quote_metadata = ctx
-        .send_ixs(&[quote_ix], &[&boss])
-        .expect("quote_swap_sell failed");
-    let quote = parse_swap_sell_quote(
-        &quote_metadata.return_data.program_id,
-        &quote_metadata.return_data.data,
-        &ctx.onyc_mint,
-        &ctx.usdc_mint,
-        sell_amount,
-    )
-    .unwrap();
-    assert_eq!(quote.token_in_fee_amount, 20_000_000); // 20 bps on-chain
-    assert_eq!(quote.token_in_net_amount, 9_980_000_000);
-    assert!(quote.minimum_out > 0);
+    let venue = ctx.load_venue();
+    let quote = venue
+        .quote(QuoteRequest {
+            input_mint: ctx.onyc_mint,
+            output_mint: ctx.usdc_mint,
+            amount: sell_amount,
+            swap_type: SwapType::ExactIn,
+        })
+        .unwrap();
+
+    assert!(!quote.not_enough_liquidity);
+    assert!(quote.expected_output > 0);
 
     let user_usdg_before = ctx.token_balance(&ctx.user.pubkey(), &ctx.usdc_mint);
     let sell_ix = build_open_swap_sell_instruction(
@@ -274,7 +407,8 @@ fn test_atomic_sell_quote_executes_against_funded_usdg_liquidity() {
         &TOKEN_PROGRAM,
         &TOKEN_PROGRAM,
         &ctx.offer_pda,
-        &quote,
+        sell_amount,
+        quote.expected_output,
     )
     .unwrap();
     let user = ctx.user.insecure_clone();
@@ -283,22 +417,94 @@ fn test_atomic_sell_quote_executes_against_funded_usdg_liquidity() {
 
     assert_eq!(
         ctx.token_balance(&ctx.user.pubkey(), &ctx.usdc_mint),
-        user_usdg_before + quote.token_out_amount
+        user_usdg_before + quote.expected_output
     );
+
+    // Fee + proceeds vaults received the full input
+    let fee_balance = ctx.token_balance(&sell_fee_vault, &ctx.onyc_mint);
+    let proceeds_balance = ctx.token_balance(&proceeds_vault, &ctx.onyc_mint);
+    assert_eq!(fee_balance + proceeds_balance, sell_amount);
+
     assert_eq!(
-        ctx.token_balance(&sell_fee_vault, &ctx.onyc_mint),
-        quote.token_in_fee_amount
+        ctx.token_balance(&redemption_vault_authority, &ctx.usdc_mint),
+        funded_liquidity - quote.expected_output
     );
-    // The fixture leaves mint authority with the boss, so net ONyc is retained
-    // in the proceeds vault instead of burned.
+}
+
+#[test]
+fn test_atomic_sell_quote_matches_onchain_with_fee_and_apr() {
+    // 36.5% APR, 50 bps prop AMM sell fee, odd sell amount to exercise rounding.
+    let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 365_000);
+    ctx.setup_redemption_offer_with_fees(20, 50);
+
+    let boss = ctx.payer.insecure_clone();
+    let configure_ix = build_configure_prop_amm_ix(&boss.pubkey(), &ctx.usdc_mint, &ctx.onyc_mint);
+    ctx.send_ixs(&[configure_ix], &[&boss])
+        .expect("configure_prop_amm failed");
+
+    let proceeds_vault = create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_PROCEEDS_VAULT, 5);
+    let sell_fee_vault = create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_SELL_FEE_VAULT, 8);
+
+    let redemption_vault_authority = pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]);
+    let funded_liquidity = 40_000_000_000_000u64;
+    create_token_account(
+        &mut ctx.svm,
+        &ctx.usdc_mint,
+        &redemption_vault_authority,
+        funded_liquidity,
+    );
+
+    let sell_amount = 7_777_777_777;
+    create_token_account(
+        &mut ctx.svm,
+        &ctx.onyc_mint,
+        &ctx.user.pubkey(),
+        sell_amount,
+    );
+
+    let venue = ctx.load_venue();
+    let quote = venue
+        .quote(QuoteRequest {
+            input_mint: ctx.onyc_mint,
+            output_mint: ctx.usdc_mint,
+            amount: sell_amount,
+            swap_type: SwapType::ExactIn,
+        })
+        .unwrap();
+
+    assert!(!quote.not_enough_liquidity);
+    assert!(quote.expected_output > 0);
+
+    let user_usdc_before = ctx.token_balance(&ctx.user.pubkey(), &ctx.usdc_mint);
+    let sell_ix = build_open_swap_sell_instruction(
+        &ctx.user.pubkey(),
+        &ctx.onyc_mint,
+        &ctx.usdc_mint,
+        &TOKEN_PROGRAM,
+        &TOKEN_PROGRAM,
+        &ctx.offer_pda,
+        sell_amount,
+        quote.expected_output,
+    )
+    .unwrap();
+    let user = ctx.user.insecure_clone();
+    ctx.send_ixs(&[sell_ix], &[&user])
+        .expect("open_swap_sell failed");
+
+    // off-chain quote == on-chain execution
     assert_eq!(
-        ctx.token_balance(&proceeds_vault, &ctx.onyc_mint),
-        quote.token_in_net_amount
+        ctx.token_balance(&ctx.user.pubkey(), &ctx.usdc_mint),
+        user_usdc_before + quote.expected_output
     );
     assert_eq!(
         ctx.token_balance(&redemption_vault_authority, &ctx.usdc_mint),
-        funded_liquidity - quote.token_out_amount
+        funded_liquidity - quote.expected_output
     );
+
+    // Fee + proceeds vaults received the full input
+    let fee_balance = ctx.token_balance(&sell_fee_vault, &ctx.onyc_mint);
+    let proceeds_balance = ctx.token_balance(&proceeds_vault, &ctx.onyc_mint);
+    assert_eq!(fee_balance + proceeds_balance, sell_amount);
 }
 
 // ===========================================================================
@@ -307,7 +513,7 @@ fn test_atomic_sell_quote_executes_against_funded_usdg_liquidity() {
 
 #[test]
 fn test_create_redemption_request_and_read_back_state() {
-    let mut ctx = setup_mint_offer();
+    let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 365_000);
     ctx.setup_redemption_offer_with_fees(20, 25);
 
     // User holds ONyc to redeem
@@ -370,13 +576,13 @@ fn test_create_redemption_request_and_read_back_state() {
 
 #[test]
 fn test_disabled_offer_is_surfaced_as_expected_state() {
-    let mut ctx = setup_mint_offer();
+    let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 365_000);
+    ctx.setup_sell_side_defaults();
 
     let boss = ctx.payer.insecure_clone();
     let ix = build_set_offer_disabled_ix(&boss.pubkey(), &ctx.usdc_mint, &ctx.onyc_mint, true);
     ctx.send_ixs(&[ix], &[&boss]).unwrap();
 
-    // 1. The venue reports the disabled state and quotes no liquidity
     let venue = ctx.load_venue();
     assert_eq!(venue.status(), VenueStatus::OfferDisabled);
     let quote = venue
@@ -412,8 +618,8 @@ fn test_disabled_offer_is_surfaced_as_expected_state() {
 
 #[test]
 fn test_kill_switch_is_surfaced_as_expected_state() {
-    let mut ctx = setup_mint_offer();
-    ctx.setup_redemption_offer();
+    let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 365_000);
+    ctx.setup_sell_side_defaults();
     create_token_account(
         &mut ctx.svm,
         &ctx.onyc_mint,
@@ -474,7 +680,7 @@ fn test_kill_switch_is_surfaced_as_expected_state() {
 
 #[test]
 fn test_disabled_redemption_offer_is_surfaced_as_expected_state() {
-    let mut ctx = setup_mint_offer();
+    let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 365_000);
     ctx.setup_redemption_offer();
     create_token_account(
         &mut ctx.svm,

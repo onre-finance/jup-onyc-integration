@@ -1,14 +1,15 @@
+use crate::constants::*;
+use crate::errors::OnreError;
+use crate::prop_amm::PropAmmPairState;
+use crate::redemption::RedemptionOffer;
+use crate::state::{CirculatingSupplyExcludedBalance, Offer, State};
+use crate::token_info::TokenInfo;
 use async_trait::async_trait;
 use solana_account::Account;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
-
-use crate::constants::*;
-use crate::errors::OnreError;
-use crate::pricing::{calculate_step_price_at, calculate_token_out_amount, find_active_vector_at};
-use crate::state::{Offer, State};
-use crate::token_info::TokenInfo;
+use spl_token_2022::extension::StateWithExtensions;
 
 /// Swap direction for quote requests
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -24,6 +25,18 @@ pub struct QuoteRequest {
     pub output_mint: Pubkey,
     pub amount: u64,
     pub swap_type: SwapType,
+}
+
+impl QuoteRequest {
+    fn to_zero_result(&self, not_enough_liquidity: bool) -> QuoteResult {
+        QuoteResult {
+            input_mint: self.input_mint,
+            output_mint: self.output_mint,
+            amount: self.amount,
+            expected_output: 0,
+            not_enough_liquidity,
+        }
+    }
 }
 
 /// Quote result returned by the venue
@@ -55,6 +68,12 @@ pub enum VenueStatus {
     OfferDisabled,
 }
 
+#[derive(Debug, Copy, Clone)]
+enum SwapDirection {
+    Buy,
+    Sell,
+}
+
 impl From<PoolProtocol> for String {
     fn from(protocol: PoolProtocol) -> Self {
         match protocol {
@@ -84,8 +103,21 @@ pub struct OnreVenue {
     pub offer: Offer,
     pub state_key: Pubkey,
     pub state: Option<State>,
+    pub prop_amm_pair_state_key: Pubkey,
+    pub prop_amm_pair_state: Option<PropAmmPairState>,
     pub token_info: Vec<TokenInfo>,
     pub token_out_supply: u64,
+
+    pub redemption_offer_key: Pubkey,
+    pub redemption_offer: Option<RedemptionOffer>,
+
+    pub redemption_vault_token_in_key: Pubkey,
+    pub redemption_vault_token_in_22_key: Pubkey,
+    pub redemption_vault_token_in: Option<spl_token_2022::state::Account>,
+
+    pub circulating_supply_excluded_balance_key: Pubkey,
+    pub circulating_supply_excluded_balance: Option<CirculatingSupplyExcludedBalance>,
+
     initialized: bool,
 }
 
@@ -122,13 +154,63 @@ impl FromAccount for OnreVenue {
 
         let (state_key, _) = Pubkey::find_program_address(&[SEED_STATE], &ONRE_PROGRAM_ID);
 
+        let (prop_amm_pair_state_key, _) = Pubkey::find_program_address(
+            &[SEED_PROP_AMM_PAIR_STATE, &pubkey.to_bytes()],
+            &ONRE_PROGRAM_ID,
+        );
+
+        // Redemption runs the opposite direction (ONyc -> USDC)
+        let (redemption_offer_key, _) = Pubkey::find_program_address(
+            &[
+                SEED_REDEMPTION_OFFER,
+                offer.token_out_mint.as_ref(),
+                offer.token_in_mint.as_ref(),
+            ],
+            &ONRE_PROGRAM_ID,
+        );
+
+        let (redemption_vault_authority, _) = Pubkey::find_program_address(
+            &[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY],
+            &ONRE_PROGRAM_ID,
+        );
+
+        // Redemption vault holds the payout asset (token_in of the buy offer, e.g. USDC)
+        let redemption_vault_token_in_account = get_associated_token_address_with_program_id(
+            &redemption_vault_authority,
+            &offer.token_in_mint,
+            &TOKEN_PROGRAM,
+        );
+        let redemption_vault_token_in_account_22 = get_associated_token_address_with_program_id(
+            &redemption_vault_authority,
+            &offer.token_in_mint,
+            &TOKEN_22_PROGRAM,
+        );
+
+        let (excluded_balance_key, _) = Pubkey::find_program_address(
+            &[SEED_CIRCULATING_SUPPLY_EXCLUDED_BALANCE],
+            &ONRE_PROGRAM_ID,
+        );
+
         Ok(OnreVenue {
             offer_key: *pubkey,
             offer,
             state_key,
             state: None,
+            prop_amm_pair_state_key,
+            prop_amm_pair_state: None,
             token_info: Vec::new(),
             token_out_supply: 0,
+
+            redemption_offer_key,
+            redemption_offer: None,
+
+            redemption_vault_token_in_key: redemption_vault_token_in_account,
+            redemption_vault_token_in_22_key: redemption_vault_token_in_account_22,
+            redemption_vault_token_in: None,
+
+            circulating_supply_excluded_balance_key: excluded_balance_key,
+            circulating_supply_excluded_balance: None,
+
             initialized: false,
         })
     }
@@ -201,6 +283,21 @@ impl OnreVenue {
         AMM_LABEL.to_string()
     }
 
+    fn swap_direction(&self, quote_request: &QuoteRequest) -> Result<SwapDirection, OnreError> {
+        let offer = self.offer;
+        let (req_in, req_out) = (quote_request.input_mint, quote_request.output_mint);
+
+        if (offer.token_in_mint, offer.token_out_mint) == (req_in, req_out) {
+            Ok(SwapDirection::Buy)
+        } else if (offer.token_in_mint, offer.token_out_mint) == (req_out, req_in) {
+            Ok(SwapDirection::Sell)
+        } else if offer.token_in_mint == req_in {
+            Err(OnreError::InvalidMint(req_out))
+        } else {
+            Err(OnreError::InvalidMint(req_in))
+        }
+    }
+
     /// Get pubkeys required for state update
     pub fn get_required_pubkeys_for_update(&self) -> Result<Vec<Pubkey>, OnreError> {
         Ok(vec![
@@ -208,6 +305,11 @@ impl OnreVenue {
             self.state_key,
             self.offer.token_in_mint,
             self.offer.token_out_mint,
+            self.prop_amm_pair_state_key,
+            self.redemption_offer_key,
+            self.redemption_vault_token_in_key,
+            self.redemption_vault_token_in_22_key,
+            self.circulating_supply_excluded_balance_key,
         ])
     }
 
@@ -218,12 +320,26 @@ impl OnreVenue {
             self.state_key,
             self.offer.token_in_mint,
             self.offer.token_out_mint,
+            self.prop_amm_pair_state_key,
+            self.redemption_offer_key,
+            self.redemption_vault_token_in_key,
+            self.redemption_vault_token_in_22_key,
+            self.circulating_supply_excluded_balance_key,
         ];
 
         let accounts = cache.get_accounts(&pubkeys).await?;
 
-        let [offer_account, state_account, token_in_account, token_out_account]: [Option<Account>;
-            4] = accounts
+        let [
+            offer_account,
+            state_account,
+            token_in_account,
+            token_out_account,
+            prop_amm_pair_state_account,
+            redemption_offer_account,
+            redemption_vault_token_in_account,
+            redemption_vault_token_in_22_account,
+            circulating_supply_excluded_balance_account,
+        ]: [Option<Account>; 9] = accounts
             .try_into()
             .map_err(|_| OnreError::FailedToFetchMultipleAccounts)?;
 
@@ -283,6 +399,45 @@ impl OnreVenue {
 
         self.token_out_supply = token_out_info.supply;
         self.token_info = vec![token_in_info, token_out_info];
+
+        // Update PropAmmPairState
+        let prop_amm_pair_state_account = prop_amm_pair_state_account
+            .ok_or(OnreError::NoAccountFound(self.prop_amm_pair_state_key))?;
+        self.prop_amm_pair_state = Some(PropAmmPairState::load(&prop_amm_pair_state_account.data)?);
+
+        // Now that we know the token program of token_in, we can choose the correct account
+        let redemption_vault_token_in_account = if token_in_info.is_token_2022 {
+            redemption_vault_token_in_22_account.ok_or(OnreError::NoAccountFound(
+                self.redemption_vault_token_in_22_key,
+            ))
+        } else {
+            redemption_vault_token_in_account.ok_or(OnreError::NoAccountFound(
+                self.redemption_vault_token_in_key,
+            ))
+        }?;
+
+        let redemption_vault_token_in =
+            StateWithExtensions::<spl_token_2022::state::Account>::unpack(
+                &redemption_vault_token_in_account.data,
+            )
+            .map_err(|_| OnreError::DeserializationFailed(self.redemption_vault_token_in_key))?
+            .base;
+
+        self.redemption_vault_token_in = Some(redemption_vault_token_in);
+
+        let redemption_offer_account =
+            redemption_offer_account.ok_or(OnreError::NoAccountFound(self.redemption_offer_key))?;
+        self.redemption_offer = Some(RedemptionOffer::load(&redemption_offer_account.data)?);
+
+        let circulating_supply_excluded_balance_account =
+            circulating_supply_excluded_balance_account.ok_or(OnreError::NoAccountFound(
+                self.circulating_supply_excluded_balance_key,
+            ))?;
+
+        self.circulating_supply_excluded_balance = Some(CirculatingSupplyExcludedBalance::load(
+            &circulating_supply_excluded_balance_account.data,
+        )?);
+
         self.initialized = true;
 
         Ok(())
@@ -292,38 +447,21 @@ impl OnreVenue {
     ///
     /// IMPORTANT: This must handle zero-input amounts without error
     pub fn quote(&self, request: QuoteRequest) -> Result<QuoteResult, OnreError> {
-        // Validate direction: OnRe only supports token_in -> token_out (ONyc minting)
-        if request.input_mint != self.offer.token_in_mint
-            || request.output_mint != self.offer.token_out_mint
-        {
-            return Err(OnreError::InvalidMint(request.input_mint));
-        }
-
         // ExactOut not supported
         if request.swap_type == SwapType::ExactOut {
             return Err(OnreError::ExactOutNotSupported);
         }
 
+        let direction = self.swap_direction(&request)?;
+
         // Handle zero-input
         if request.amount == 0 {
-            return Ok(QuoteResult {
-                input_mint: request.input_mint,
-                output_mint: request.output_mint,
-                amount: 0,
-                expected_output: 0,
-                not_enough_liquidity: false,
-            });
+            return Ok(request.to_zero_result(false));
         }
 
         // Kill switch or v5 disabled offer: surface as no-liquidity, not an error
         if self.status() != VenueStatus::Active {
-            return Ok(QuoteResult {
-                input_mint: request.input_mint,
-                output_mint: request.output_mint,
-                amount: request.amount,
-                expected_output: 0,
-                not_enough_liquidity: true,
-            });
+            return Ok(request.to_zero_result(true));
         }
 
         // Get current time for pricing
@@ -332,78 +470,90 @@ impl OnreVenue {
             .map_err(|_| OnreError::TimeError)?
             .as_secs();
 
+        let vectors: [onre_pricing::PriceVector; MAX_VECTORS] =
+            self.offer.vectors.map(|vector| vector.into());
+
         // Find active pricing vector
-        let active_vector = match find_active_vector_at(&self.offer, current_time) {
-            Ok(v) => v,
+        let active_vector = match onre_pricing::find_active_vector_at(&vectors, current_time) {
+            Ok(vector) => vector,
             Err(_) => {
-                return Ok(QuoteResult {
-                    input_mint: request.input_mint,
-                    output_mint: request.output_mint,
-                    amount: request.amount,
-                    expected_output: 0,
-                    not_enough_liquidity: true,
-                });
+                return Ok(request.to_zero_result(true));
             }
         };
-
-        // Calculate current price
-        let current_price = calculate_step_price_at(
-            active_vector.apr,
-            active_vector.base_price,
-            active_vector.base_time,
-            active_vector.price_fix_duration,
-            current_time,
-        )?;
-
-        // Calculate fee
-        let fee_amount = (request.amount as u128)
-            .checked_mul(self.offer.permissionless_fee_basis_points() as u128)
-            .ok_or(OnreError::MathOverflow)?
-            .checked_div(MAX_BASIS_POINTS)
-            .ok_or(OnreError::MathOverflow)? as u64;
-
-        let token_in_net = request
-            .amount
-            .checked_sub(fee_amount)
-            .ok_or(OnreError::MathOverflow)?;
 
         // Get token decimals
         let token_in_decimals = self.get_token(0)?.decimals as u8;
         let token_out_decimals = self.get_token(1)?.decimals as u8;
 
-        // Calculate output amount
-        let out_amount = calculate_token_out_amount(
-            token_in_net,
-            current_price,
-            token_in_decimals,
-            token_out_decimals,
-        )?;
+        let amount_out = match direction {
+            SwapDirection::Buy => {
+                let state = self.state.ok_or(OnreError::NotInitialized)?;
 
-        // Check max supply
-        if let Some(state) = &self.state {
-            if state.max_supply > 0 {
-                let new_supply = self
-                    .token_out_supply
-                    .checked_add(out_amount)
-                    .ok_or(OnreError::MathOverflow)?;
+                let amount_out = onre_pricing::buy::calculate_amount_out(
+                    active_vector,
+                    current_time,
+                    request.amount,
+                    // Note: We are using the permisionless flow, which has its own fee_basis_points
+                    self.offer.fee_basis_points_permissionless,
+                    token_in_decimals,
+                    token_out_decimals,
+                )?;
 
-                if new_supply > state.max_supply {
-                    return Ok(QuoteResult {
-                        input_mint: request.input_mint,
-                        output_mint: request.output_mint,
-                        amount: request.amount,
-                        expected_output: 0,
-                        not_enough_liquidity: true,
-                    });
+                // Check max supply
+                if state.max_supply > 0 {
+                    let new_supply = self
+                        .token_out_supply
+                        .checked_add(amount_out)
+                        .ok_or(OnreError::MathOverflow)?;
+
+                    if new_supply > state.max_supply {
+                        return Ok(request.to_zero_result(true));
+                    }
                 }
+
+                amount_out
             }
-        }
+            SwapDirection::Sell => {
+                let prop_amm_state = self.prop_amm_pair_state.ok_or(OnreError::NotInitialized)?;
+                if prop_amm_state.is_disabled() {
+                    return Ok(request.to_zero_result(true));
+                }
+
+                let redemption_offer = self.redemption_offer.ok_or(OnreError::NotInitialized)?;
+                let excluded_balance = self
+                    .circulating_supply_excluded_balance
+                    .ok_or(OnreError::NotInitialized)?;
+                let redemption_vault_token_out = self
+                    .redemption_vault_token_in
+                    .ok_or(OnreError::NotInitialized)?;
+
+                let circulating_supply = self
+                    .token_out_supply
+                    .saturating_sub(excluded_balance.amount);
+
+                onre_pricing::sell::calculate_amount_out(
+                    active_vector,
+                    current_time,
+                    request.amount,
+                    redemption_offer.fee_basis_points_prop_amm_sell,
+                    token_out_decimals,
+                    token_in_decimals,
+                    prop_amm_state.min_sell_fee(),
+                    &onre_pricing::types::LiquidityParams {
+                        liquidity: redemption_vault_token_out.amount,
+                        liquidity_cap_target_bps: redemption_offer.vault_target_bps,
+                        circulating_supply,
+                        dampening: prop_amm_state.to_dampening_state(),
+                    },
+                )?
+            }
+        };
 
         Ok(QuoteResult {
             input_mint: request.input_mint,
             output_mint: request.output_mint,
             amount: request.amount,
-            expected_output: out_amount,
+            expected_output: amount_out,
             not_enough_liquidity: false,
         })
     }
