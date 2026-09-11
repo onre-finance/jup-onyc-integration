@@ -1,10 +1,9 @@
 //! PropAmmPairState deserialization for OnRe's v5 proprietary AMM.
 
-use solana_pubkey::Pubkey;
-
-use crate::constants::*;
+use crate::constants::{ANCHOR_DISCRIMINATOR_LEN, PROP_AMM_PAIR_STATE_ACCOUNT_DISCRIMINATOR};
 use crate::errors::OnreError;
 use crate::util::{read_i64, read_pubkey, read_u16, read_u32, read_u64};
+use solana_pubkey::Pubkey;
 
 pub const PROP_AMM_PAIR_STATE_RESERVED_BYTES: usize = 284;
 // 3*32 + 1 + 2 + 4 + 4 + 4 + 8 + 4 + 8 + 8 + 8 + 8 + 4 + 8 + 1 + 284
@@ -104,6 +103,7 @@ fn read_bool(data: &[u8], offset: usize) -> Result<bool, OnreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{ANCHOR_DISCRIMINATOR_LEN, PROP_AMM_PAIR_STATE_ACCOUNT_DISCRIMINATOR};
 
     fn serialized_pair_state(offer: Pubkey, asset: Pubkey, onyc: Pubkey) -> Vec<u8> {
         let mut d = PROP_AMM_PAIR_STATE_ACCOUNT_DISCRIMINATOR.to_vec();

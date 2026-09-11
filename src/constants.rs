@@ -35,9 +35,6 @@ pub const SEED_PROP_AMM_PAIR_STATE: &[u8] = b"prop_amm_pair";
 pub const SEED_PROP_AMM_PROCEEDS_VAULT: &[u8] = b"prop_amm_proceeds";
 pub const SEED_PROP_AMM_SELL_FEE_VAULT: &[u8] = b"prop_amm_sell_fee";
 
-// Maximum number of pricing vectors per offer
-pub const MAX_VECTORS: usize = 10;
-
 // Anchor discriminator length
 pub const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
 

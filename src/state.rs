@@ -1,14 +1,14 @@
 //! Account state deserialization for OnRe protocol
 
-use bytemuck::{Pod, Zeroable};
-use solana_pubkey::Pubkey;
-
 use crate::constants::{
     ANCHOR_DISCRIMINATOR_LEN, CIRCULATING_SUPPLY_EXCLUDED_BALANCE_ACCOUNT_DISCRIMINATOR,
-    MAX_VECTORS, OFFER_ACCOUNT_DISCRIMINATOR, STATE_ACCOUNT_DISCRIMINATOR,
+    OFFER_ACCOUNT_DISCRIMINATOR, STATE_ACCOUNT_DISCRIMINATOR,
 };
 use crate::errors::OnreError;
 use crate::util::{read_i64, read_pubkey, read_u64};
+use bytemuck::{Pod, Zeroable};
+use onre_pricing::MAX_VECTORS;
+use solana_pubkey::Pubkey;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
