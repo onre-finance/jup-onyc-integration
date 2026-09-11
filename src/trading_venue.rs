@@ -1,10 +1,20 @@
-use crate::constants::*;
+use crate::constants::{
+    AMM_LABEL, ASSOCIATED_TOKEN_PROGRAM, ONRE_PROGRAM_ID, SEED_BUFFER_STATE,
+    SEED_CIRCULATING_SUPPLY_EXCLUDED_BALANCE, SEED_CONFIGURABLE_VAULT, SEED_MANAGEMENT_FEE_VAULT,
+    SEED_MARKET_STATS, SEED_MINT_AUTHORITY, SEED_OFFER, SEED_OFFER_PROCEEDS_VAULT,
+    SEED_OFFER_VAULT_AUTHORITY, SEED_PERFORMANCE_FEE_VAULT, SEED_PERMISSIONLESS_AUTHORITY,
+    SEED_PERMISSIONLESS_OFFER_FEE_VAULT, SEED_PROP_AMM_PAIR_STATE, SEED_REDEMPTION_OFFER,
+    SEED_REDEMPTION_OFFER_VAULT_AUTHORITY, SEED_RESERVE_VAULT_AUTHORITY, SEED_STATE,
+    SYSTEM_PROGRAM, SYSVAR_INSTRUCTIONS, TAKE_OFFER_PERMISSIONLESS_DISCRIMINATOR,
+    TAKE_OFFER_PERMISSIONLESS_V2_DISCRIMINATOR, TOKEN_22_PROGRAM, TOKEN_PROGRAM,
+};
 use crate::errors::OnreError;
 use crate::prop_amm::PropAmmPairState;
 use crate::redemption::RedemptionOffer;
 use crate::state::{CirculatingSupplyExcludedBalance, Offer, State};
 use crate::token_info::TokenInfo;
 use async_trait::async_trait;
+use onre_pricing::MAX_VECTORS;
 use solana_account::Account;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
@@ -802,6 +812,11 @@ impl OnreVenue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{
+        ASSOCIATED_TOKEN_PROGRAM, OFFER_ACCOUNT_DISCRIMINATOR, SEED_MINT_AUTHORITY,
+        SEED_OFFER_VAULT_AUTHORITY, SEED_PERMISSIONLESS_AUTHORITY, SEED_STATE,
+        STATE_ACCOUNT_DISCRIMINATOR, SYSTEM_PROGRAM, TOKEN_PROGRAM,
+    };
 
     #[test]
     fn test_zero_input_quote() {
