@@ -141,7 +141,7 @@ impl FromAccount for OnreVenue {
                 actual: account.owner,
             });
         }
-        let offer = Offer::load(&account.data)?;
+        let offer = Offer::load(&account.data).ok_or(OnreError::DeserializationFailed(*pubkey))?;
 
         let expected_offer = Pubkey::find_program_address(
             &[
@@ -365,7 +365,8 @@ impl OnreVenue {
             });
         }
 
-        let updated_offer = Offer::load(&offer_account.data)?;
+        let updated_offer = Offer::load(&offer_account.data)
+            .ok_or(OnreError::DeserializationFailed(self.offer_key))?;
         let (expected_offer_key, _) = Pubkey::find_program_address(
             &[
                 SEED_OFFER,
@@ -393,7 +394,10 @@ impl OnreVenue {
                 actual: state_account.owner,
             });
         }
-        self.state = Some(State::load(&state_account.data)?);
+        self.state = Some(
+            State::load(&state_account.data)
+                .ok_or(OnreError::DeserializationFailed(self.state_key))?,
+        );
 
         // Update token info
         let token_in_info = token_in_account
@@ -414,7 +418,12 @@ impl OnreVenue {
         // Update PropAmmPairState
         let prop_amm_pair_state_account = prop_amm_pair_state_account
             .ok_or(OnreError::NoAccountFound(self.prop_amm_pair_state_key))?;
-        self.prop_amm_pair_state = Some(PropAmmPairState::load(&prop_amm_pair_state_account.data)?);
+
+        self.prop_amm_pair_state = Some(
+            PropAmmPairState::load(&prop_amm_pair_state_account.data).ok_or(
+                OnreError::DeserializationFailed(self.prop_amm_pair_state_key),
+            )?,
+        );
 
         // Now that we know the token program of token_in, we can choose the correct account
         let redemption_vault_token_in_account = if token_in_info.is_token_2022 {
@@ -438,16 +447,24 @@ impl OnreVenue {
 
         let redemption_offer_account =
             redemption_offer_account.ok_or(OnreError::NoAccountFound(self.redemption_offer_key))?;
-        self.redemption_offer = Some(RedemptionOffer::load(&redemption_offer_account.data)?);
+        self.redemption_offer = Some(
+            RedemptionOffer::load(&redemption_offer_account.data)
+                .ok_or(OnreError::DeserializationFailed(self.redemption_offer_key))?,
+        );
 
         let circulating_supply_excluded_balance_account =
             circulating_supply_excluded_balance_account.ok_or(OnreError::NoAccountFound(
                 self.circulating_supply_excluded_balance_key,
             ))?;
 
-        self.circulating_supply_excluded_balance = Some(CirculatingSupplyExcludedBalance::load(
-            &circulating_supply_excluded_balance_account.data,
-        )?);
+        self.circulating_supply_excluded_balance = Some(
+            CirculatingSupplyExcludedBalance::load(
+                &circulating_supply_excluded_balance_account.data,
+            )
+            .ok_or(OnreError::DeserializationFailed(
+                self.circulating_supply_excluded_balance_key,
+            ))?,
+        );
 
         self.initialized = true;
 
@@ -693,12 +710,6 @@ impl OnreVenue {
             get_associated_token_address_with_program_id(owner, mint, program)
         };
 
-        let offer_pda = pda(&[SEED_OFFER, token_in_mint.as_ref(), token_out_mint.as_ref()]);
-        let state_pda = pda(&[SEED_STATE]);
-        let vault_authority = pda(&[SEED_OFFER_VAULT_AUTHORITY]);
-        let permissionless_authority = pda(&[SEED_PERMISSIONLESS_AUTHORITY]);
-        let mint_authority = pda(&[SEED_MINT_AUTHORITY]);
-        // Redemption offer for the opposite direction (ONyc -> token_in)
         // Shared PDAs (offer/redemption always use the canonical offer mint order)
         let offer_pda = pda(&[
             SEED_OFFER,
@@ -1003,7 +1014,7 @@ mod tests {
 
         let mut data = state_bytes(&Pubkey::new_unique(), &venue.offer_key);
         data[72] = 1; // is_killed
-        venue.state = Some(crate::state::State::load(&data).unwrap());
+        venue.state = Some(State::load(&data).unwrap());
 
         assert_eq!(venue.status(), VenueStatus::KillSwitchActive);
     }
