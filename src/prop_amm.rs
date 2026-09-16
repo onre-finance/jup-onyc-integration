@@ -1,7 +1,6 @@
 //! PropAmmPairState deserialization for OnRe's v5 proprietary AMM.
 
 use crate::constants::{ANCHOR_DISCRIMINATOR_LEN, PROP_AMM_PAIR_STATE_ACCOUNT_DISCRIMINATOR};
-use crate::errors::OnreError;
 use crate::util::{read_i64, read_pubkey, read_u16, read_u32, read_u64};
 use solana_pubkey::Pubkey;
 
@@ -32,19 +31,19 @@ pub struct PropAmmPairState {
 }
 
 impl PropAmmPairState {
-    pub fn load(data: &[u8]) -> Result<Self, OnreError> {
+    pub fn load(data: &[u8]) -> Option<Self> {
         if data.len() < ANCHOR_DISCRIMINATOR_LEN + PROP_AMM_PAIR_STATE_SERIALIZED_LEN {
-            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+            return None;
         }
         if data[..ANCHOR_DISCRIMINATOR_LEN] != PROP_AMM_PAIR_STATE_ACCOUNT_DISCRIMINATOR {
-            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+            return None;
         }
         let d = &data[ANCHOR_DISCRIMINATOR_LEN..];
 
         let mut reserved = [0u8; PROP_AMM_PAIR_STATE_RESERVED_BYTES];
         reserved.copy_from_slice(&d[168..168 + PROP_AMM_PAIR_STATE_RESERVED_BYTES]);
 
-        Ok(PropAmmPairState {
+        Some(PropAmmPairState {
             offer: read_pubkey(d, 0),
             asset_mint: read_pubkey(d, 32),
             onyc_mint: read_pubkey(d, 64),
@@ -92,11 +91,11 @@ impl PropAmmPairState {
     }
 }
 
-fn read_bool(data: &[u8], offset: usize) -> Result<bool, OnreError> {
+fn read_bool(data: &[u8], offset: usize) -> Option<bool> {
     match data.get(offset) {
-        Some(&0) => Ok(false),
-        Some(&1) => Ok(true),
-        _ => Err(OnreError::DeserializationFailed(Pubkey::default())),
+        Some(&0) => Some(false),
+        Some(&1) => Some(true),
+        _ => None,
     }
 }
 
@@ -191,16 +190,10 @@ mod tests {
             Pubkey::new_unique(),
         );
 
-        assert!(matches!(
-            PropAmmPairState::load(&data[..data.len() - 1]),
-            Err(OnreError::DeserializationFailed(_))
-        ));
+        assert!(PropAmmPairState::load(&data[..data.len() - 1]).is_none());
 
         let mut wrong_disc = data.clone();
         wrong_disc[0] ^= 0xff;
-        assert!(matches!(
-            PropAmmPairState::load(&wrong_disc),
-            Err(OnreError::DeserializationFailed(_))
-        ));
+        assert!(PropAmmPairState::load(&wrong_disc).is_none());
     }
 }

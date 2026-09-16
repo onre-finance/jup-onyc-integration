@@ -6,7 +6,6 @@
 use solana_pubkey::Pubkey;
 
 use crate::constants::{ANCHOR_DISCRIMINATOR_LEN, REDEMPTION_OFFER_ACCOUNT_DISCRIMINATOR};
-use crate::errors::OnreError;
 use crate::util::{read_pubkey, read_u128, read_u16, read_u64};
 
 /// v5 RedemptionOffer account (borsh layout):
@@ -31,26 +30,27 @@ pub struct RedemptionOffer {
 const REDEMPTION_OFFER_SERIALIZED_LEN: usize = 32 + 32 + 32 + 16 + 16 + 2 + 8 + 1 + 2 + 1 + 2 + 104;
 
 impl RedemptionOffer {
-    pub fn load(data: &[u8]) -> Result<Self, OnreError> {
+    pub fn load(data: &[u8]) -> Option<Self> {
         if data.len() < ANCHOR_DISCRIMINATOR_LEN + REDEMPTION_OFFER_SERIALIZED_LEN {
-            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+            return None;
         }
         if data[..ANCHOR_DISCRIMINATOR_LEN] != REDEMPTION_OFFER_ACCOUNT_DISCRIMINATOR {
-            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+            return None;
         }
-        let d = &data[ANCHOR_DISCRIMINATOR_LEN..];
-        Ok(RedemptionOffer {
-            offer: read_pubkey(d, 0),
-            token_in_mint: read_pubkey(d, 32),
-            token_out_mint: read_pubkey(d, 64),
-            executed_redemptions: read_u128(d, 96),
-            requested_redemptions: read_u128(d, 112),
-            fee_basis_points: read_u16(d, 128),
-            request_counter: read_u64(d, 130),
-            bump: d[138],
-            vault_target_bps: read_u16(d, 139),
-            disabled: d[141],
-            fee_basis_points_prop_amm_sell: read_u16(d, 142),
+        let offer_data = &data[ANCHOR_DISCRIMINATOR_LEN..];
+
+        Some(RedemptionOffer {
+            offer: read_pubkey(offer_data, 0),
+            token_in_mint: read_pubkey(offer_data, 32),
+            token_out_mint: read_pubkey(offer_data, 64),
+            executed_redemptions: read_u128(offer_data, 96),
+            requested_redemptions: read_u128(offer_data, 112),
+            fee_basis_points: read_u16(offer_data, 128),
+            request_counter: read_u64(offer_data, 130),
+            bump: offer_data[138],
+            vault_target_bps: read_u16(offer_data, 139),
+            disabled: offer_data[141],
+            fee_basis_points_prop_amm_sell: read_u16(offer_data, 142),
         })
     }
 

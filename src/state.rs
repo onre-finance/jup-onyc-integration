@@ -4,7 +4,6 @@ use crate::constants::{
     ANCHOR_DISCRIMINATOR_LEN, CIRCULATING_SUPPLY_EXCLUDED_BALANCE_ACCOUNT_DISCRIMINATOR,
     OFFER_ACCOUNT_DISCRIMINATOR, STATE_ACCOUNT_DISCRIMINATOR,
 };
-use crate::errors::OnreError;
 use crate::util::{read_i64, read_pubkey, read_u64};
 use bytemuck::{Pod, Zeroable};
 use onre_pricing::MAX_VECTORS;
@@ -26,20 +25,18 @@ pub struct Offer {
 }
 
 impl Offer {
-    pub fn load(data: &[u8]) -> Result<Self, OnreError> {
-        let expected_size = ANCHOR_DISCRIMINATOR_LEN + std::mem::size_of::<Offer>();
+    pub fn load(data: &[u8]) -> Option<Self> {
+        let expected_size = ANCHOR_DISCRIMINATOR_LEN + size_of::<Offer>();
         if data.len() < expected_size {
-            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+            return None;
         }
         if data[..ANCHOR_DISCRIMINATOR_LEN] != OFFER_ACCOUNT_DISCRIMINATOR {
-            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+            return None;
         }
 
-        let offer_data = &data
-            [ANCHOR_DISCRIMINATOR_LEN..ANCHOR_DISCRIMINATOR_LEN + std::mem::size_of::<Offer>()];
-        bytemuck::try_from_bytes::<Offer>(offer_data)
-            .copied()
-            .map_err(|_| OnreError::DeserializationFailed(Pubkey::default()))
+        let offer_data = &data[ANCHOR_DISCRIMINATOR_LEN..expected_size];
+
+        bytemuck::try_from_bytes::<Offer>(offer_data).copied().ok()
     }
 
     pub fn needs_approval(&self) -> bool {
@@ -48,10 +45,6 @@ impl Offer {
 
     pub fn allow_permissionless(&self) -> bool {
         self.allow_permissionless != 0
-    }
-
-    pub fn permissionless_fee_basis_points(&self) -> u16 {
-        self.fee_basis_points_permissionless
     }
 
     /// Whether the offer is disabled by emergency controls (v5 `require_enabled`)
@@ -111,34 +104,34 @@ const STATE_SERIALIZED_LEN: usize =
     32 + 32 + 1 + 32 + MAX_ADMINS * 32 + 32 + 32 + 1 + 8 + 32 + 8 + 32 + 56;
 
 impl State {
-    pub fn load(data: &[u8]) -> Result<Self, OnreError> {
+    pub fn load(data: &[u8]) -> Option<Self> {
         let expected_size = ANCHOR_DISCRIMINATOR_LEN + STATE_SERIALIZED_LEN;
         if data.len() < expected_size {
-            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+            return None;
         }
         if data[..ANCHOR_DISCRIMINATOR_LEN] != STATE_ACCOUNT_DISCRIMINATOR {
-            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+            return None;
         }
-        let d = &data[ANCHOR_DISCRIMINATOR_LEN..];
+        let state_data = &data[ANCHOR_DISCRIMINATOR_LEN..];
 
         let mut admins = [Pubkey::default(); MAX_ADMINS];
         for (i, admin) in admins.iter_mut().enumerate() {
-            *admin = read_pubkey(d, 97 + i * 32);
+            *admin = read_pubkey(state_data, 97 + i * 32);
         }
 
-        Ok(State {
-            boss: read_pubkey(d, 0),
-            proposed_boss: read_pubkey(d, 32),
-            is_killed: d[64],
-            onyc_mint: read_pubkey(d, 65),
+        Some(State {
+            boss: read_pubkey(state_data, 0),
+            proposed_boss: read_pubkey(state_data, 32),
+            is_killed: state_data[64],
+            onyc_mint: read_pubkey(state_data, 65),
             admins,
-            approver1: read_pubkey(d, 737),
-            approver2: read_pubkey(d, 769),
-            bump: d[801],
-            max_supply: read_u64(d, 802),
-            redemption_admin: read_pubkey(d, 810),
-            max_mint_amount: read_u64(d, 842),
-            main_offer: read_pubkey(d, 850),
+            approver1: read_pubkey(state_data, 737),
+            approver2: read_pubkey(state_data, 769),
+            bump: state_data[801],
+            max_supply: read_u64(state_data, 802),
+            redemption_admin: read_pubkey(state_data, 810),
+            max_mint_amount: read_u64(state_data, 842),
+            main_offer: read_pubkey(state_data, 850),
         })
     }
 
@@ -159,27 +152,27 @@ pub struct CirculatingSupplyExcludedBalance {
 const CIRCULATING_SUPPLY_EXCLUDED_BALANCE_SERIALIZED_LEN: usize = 8 + 8 + 8 + 1 + 31;
 
 impl CirculatingSupplyExcludedBalance {
-    pub fn load(data: &[u8]) -> Result<Self, OnreError> {
+    pub fn load(data: &[u8]) -> Option<Self> {
         let expected_size =
             ANCHOR_DISCRIMINATOR_LEN + CIRCULATING_SUPPLY_EXCLUDED_BALANCE_SERIALIZED_LEN;
         if data.len() < expected_size {
-            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+            return None;
         }
         if data[..ANCHOR_DISCRIMINATOR_LEN]
             != CIRCULATING_SUPPLY_EXCLUDED_BALANCE_ACCOUNT_DISCRIMINATOR
         {
-            return Err(OnreError::DeserializationFailed(Pubkey::default()));
+            return None;
         }
-        let d = &data[ANCHOR_DISCRIMINATOR_LEN..];
+        let account_data = &data[ANCHOR_DISCRIMINATOR_LEN..];
 
         let mut reserved = [0u8; 31];
-        reserved.copy_from_slice(&d[25..56]);
+        reserved.copy_from_slice(&account_data[25..56]);
 
-        Ok(Self {
-            amount: read_u64(d, 0),
-            last_updated_at: read_i64(d, 8),
-            last_updated_slot: read_u64(d, 16),
-            bump: d[24],
+        Some(Self {
+            amount: read_u64(account_data, 0),
+            last_updated_at: read_i64(account_data, 8),
+            last_updated_slot: read_u64(account_data, 16),
+            bump: account_data[24],
             reserved,
         })
     }
@@ -260,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_state_load_rejects_truncated_data() {
-        assert!(State::load(&[0u8; 100]).is_err());
+        assert!(State::load(&[0u8; 100]).is_none());
     }
 
     #[test]
