@@ -517,7 +517,7 @@ impl OnreVenue {
             SwapDirection::Buy => {
                 let state = self.state.ok_or(OnreError::NotInitialized)?;
 
-                let amount_out = onre_pricing::buy::calculate_amount_out(
+                let amount_out = onre_pricing::buy::calculate_amount_out_from_vector(
                     active_vector,
                     current_time,
                     request.amount,
@@ -559,7 +559,7 @@ impl OnreVenue {
                     .token_out_supply
                     .saturating_sub(excluded_balance.amount);
 
-                onre_pricing::sell::calculate_amount_out(
+                onre_pricing::sell::calculate_amount_out_from_vector(
                     active_vector,
                     current_time,
                     request.amount,
