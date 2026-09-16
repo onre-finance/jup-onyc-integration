@@ -1,4 +1,4 @@
-use crate::math_utils::{ceil_div_u128, mul_div_round, pow_fixed};
+use crate::math_utils::{mul_div_round, pow_fixed};
 use crate::{
     constants::{APR_SCALE, MAX_BASIS_POINTS},
     error::PricingError,
@@ -147,8 +147,8 @@ pub fn calculate_fee(token_amount: u64, fee_basis_points: u16) -> Result<u64, Pr
 
     let fee_numerator = token_amount as u128 * fee_basis_points as u128;
 
-    let fee_amount: u64 = ceil_div_u128(fee_numerator, MAX_BASIS_POINTS)
-        .ok_or(PricingError::MathOverflow)?
+    let fee_amount: u64 = fee_numerator
+        .div_ceil(MAX_BASIS_POINTS)
         .try_into()
         .map_err(|_| PricingError::MathOverflow)?;
 
