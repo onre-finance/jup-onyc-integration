@@ -9,14 +9,6 @@ pub fn mul_div_round(a: u128, b: u128, denom: u128) -> Option<u128> {
     Some(adj / denom)
 }
 
-pub fn ceil_div_u128(numerator: u128, denominator: u128) -> Option<u128> {
-    if denominator == 0 {
-        return None;
-    }
-
-    Some((numerator.checked_add(denominator - 1)?) / denominator)
-}
-
 /// Fixed-point exponentiation: `(x / base)^n * base`
 ///
 /// # Arguments
@@ -50,35 +42,6 @@ mod tests {
     use crate::APR_SCALE;
 
     const SCALE: u128 = 1_000_000_000_000_000_000;
-
-    // ── ceil_div_u128 ──────────────────────────────────────────────
-
-    #[test]
-    fn ceil_div_exact() {
-        assert_eq!(ceil_div_u128(10, 5), Some(2));
-    }
-
-    #[test]
-    fn ceil_div_rounds_up() {
-        assert_eq!(ceil_div_u128(11, 5), Some(3));
-    }
-
-    #[test]
-    fn ceil_div_zero_denominator() {
-        assert_eq!(ceil_div_u128(10, 0), None);
-    }
-
-    #[test]
-    fn ceil_div_zero_numerator() {
-        assert_eq!(ceil_div_u128(0, 5), Some(0));
-    }
-
-    #[test]
-    fn ceil_div_max_numerator() {
-        assert_eq!(ceil_div_u128(u128::MAX, 1), Some(u128::MAX));
-        // u128::MAX + (2-1) overflows checked_add → None
-        assert_eq!(ceil_div_u128(u128::MAX, 2), None);
-    }
 
     // ── mul_div_round ──────────────────────────────────────────────
 
