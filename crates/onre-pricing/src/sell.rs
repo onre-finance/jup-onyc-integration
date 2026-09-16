@@ -18,8 +18,9 @@ const CADENCE_WAVE_CAP_DIVISOR: u8 = 3;
 
 const CADENCE_WAVE_DIVISOR: u64 = CADENCE_WAVE_SCALE as u64 * CADENCE_WAVE_CAP_DIVISOR as u64;
 
-/// Shortcut for calling [`calculate_step_price_at`] and [`calculate_token_out_amount`].
-pub fn calculate_amount_out(
+/// Shortcut for calling [`calculate_step_price_at`] and [`calculate_amount_out`].
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_amount_out_from_vector(
     vector: &PriceVector,
     time: u64,
     amount_in: u64,
@@ -37,7 +38,7 @@ pub fn calculate_amount_out(
         time,
     )?;
 
-    calculate_token_out_amount(
+    calculate_amount_out(
         amount_in,
         price,
         time,
@@ -54,7 +55,8 @@ pub fn calculate_amount_out(
 ///
 /// # Arguments
 /// * `price` - Price with 9 decimal precision
-pub fn calculate_token_out_amount(
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_amount_out(
     amount_in: u64,
     price: u64,
     time: u64,
@@ -357,7 +359,7 @@ fn preview_current_sell_trade_count(
     time: u64,
 ) -> Result<u32, PricingError> {
     let epoch_duration = dampening.epoch_duration_seconds;
-    if epoch_duration <= 0 {
+    if epoch_duration == 0 {
         return Err(PricingError::InvalidEpochDuration);
     }
 
@@ -640,7 +642,7 @@ mod tests {
             },
         };
 
-        let out = calculate_amount_out(
+        let out = calculate_amount_out_from_vector(
             &vector,
             1_000 + 100 * SECONDS_IN_DAY, // base + 100 days
             100_000_000_000,              // 100 ONyc
@@ -652,7 +654,7 @@ mod tests {
         )
         .unwrap();
 
-        let out_1 = calculate_amount_out(
+        let out_1 = calculate_amount_out_from_vector(
             &vector,
             1_000 + 101 * SECONDS_IN_DAY, // base + 101 days
             100_000_000_000,              // 100 ONyc
@@ -712,7 +714,7 @@ mod tests {
             },
         };
 
-        let out = calculate_amount_out(
+        let out = calculate_amount_out_from_vector(
             &vector,
             1_000 + 100 * SECONDS_IN_DAY, // base + 100 days
             100_000_000_000,              // 100 ONyc
@@ -753,7 +755,7 @@ mod tests {
             prev_net_sell_volume: 0,
         };
 
-        let result = calculate_amount_out(
+        let result = calculate_amount_out_from_vector(
             &vector,
             1_000,
             99, // amount_in < min_fee

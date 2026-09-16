@@ -4,8 +4,8 @@ use crate::{
 };
 use core::cmp::max;
 
-/// Shortcut for calling [`calculate_step_price_at`] and [`calculate_token_out_amount`].
-pub fn calculate_amount_out(
+/// Shortcut for calling [`calculate_step_price_at`] and [`calculate_amount_out`].
+pub fn calculate_amount_out_from_vector(
     vector: &PriceVector,
     time: u64,
     amount_in: u64,
@@ -21,7 +21,7 @@ pub fn calculate_amount_out(
         time,
     )?;
 
-    calculate_token_out_amount(amount_in, price, fee_bps, in_decimals, out_decimals)
+    calculate_amount_out(amount_in, price, fee_bps, in_decimals, out_decimals)
 }
 
 /// Converts a token_in amount to token_out using offer pricing where `price` is token_in per ONyc.
@@ -30,7 +30,8 @@ pub fn calculate_amount_out(
 ///
 /// # Arguments
 /// * `price` - Price with 9 decimal precision
-pub fn calculate_token_out_amount(
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_amount_out(
     amount_in: u64,
     price: u64,
     fee_bps: u16,
@@ -75,7 +76,7 @@ mod tests {
 
     #[test]
     fn token_out_with_price_floors() {
-        let out = calculate_token_out_amount(
+        let out = calculate_amount_out(
             100_000_000,   // 100 USDC
             1_500_000_000, // price = 1.5
             0,
@@ -90,7 +91,7 @@ mod tests {
 
     #[test]
     fn token_out_with_price_below_one() {
-        let out = calculate_token_out_amount(
+        let out = calculate_amount_out(
             100_000_000, // 100 USDC
             500_000_000, // price = 0.5
             0,
@@ -105,7 +106,7 @@ mod tests {
 
     #[test]
     fn token_out_with_equal_decimals() {
-        let out = calculate_token_out_amount(
+        let out = calculate_amount_out(
             100_000_000_000, // 100 tokens
             1_000_000_000,   // price = 1.0
             0,
@@ -120,7 +121,7 @@ mod tests {
 
     #[test]
     fn token_out_with_fewer_out_decimals() {
-        let out = calculate_token_out_amount(
+        let out = calculate_amount_out(
             100_000_000_000, // 100 tokens
             1_000_000_000,   // price = 1.0
             0,
@@ -135,27 +136,27 @@ mod tests {
 
     #[test]
     fn token_out_zero_input_returns_zero() {
-        let out = calculate_token_out_amount(0, 1_000_000_000, 0, 6, 9).unwrap();
+        let out = calculate_amount_out(0, 1_000_000_000, 0, 6, 9).unwrap();
 
         assert_eq!(out, 0);
     }
 
     #[test]
     fn token_out_rejects_zero_price() {
-        let result = calculate_token_out_amount(100_000_000, 0, 0, 6, 9);
+        let result = calculate_amount_out(100_000_000, 0, 0, 6, 9);
 
         assert_eq!(result, Err(PricingError::ZeroPriceNotAllowed));
     }
 
     #[test]
     fn token_out_rejects_decimals_above_max() {
-        let result = calculate_token_out_amount(100, 1_000_000_000, 0, 19, 9);
+        let result = calculate_amount_out(100, 1_000_000_000, 0, 19, 9);
         assert_eq!(
             result,
             Err(PricingError::DecimalsExceedMax { max: 18, was: 19 })
         );
 
-        let result = calculate_token_out_amount(100, 1_000_000_000, 0, 9, 20);
+        let result = calculate_amount_out(100, 1_000_000_000, 0, 9, 20);
         assert_eq!(
             result,
             Err(PricingError::DecimalsExceedMax { max: 18, was: 20 })
@@ -164,13 +165,13 @@ mod tests {
 
     #[test]
     fn token_out_numerator_overflow() {
-        let result = calculate_token_out_amount(u64::MAX, 1_000_000_000, 0, 0, 18);
+        let result = calculate_amount_out(u64::MAX, 1_000_000_000, 0, 0, 18);
         assert_eq!(result, Err(PricingError::MathOverflow));
     }
 
     #[test]
     fn token_out_with_max_decimals() {
-        let out = calculate_token_out_amount(
+        let out = calculate_amount_out(
             100_000_000_000, // small amount at 18 decimals
             2_000_000_000,   // price = 2.0
             0,
@@ -184,7 +185,7 @@ mod tests {
 
     #[test]
     fn token_out_full_fee_returns_zero() {
-        let out = calculate_token_out_amount(
+        let out = calculate_amount_out(
             100,
             1_000_000_000, // price = 1.0
             10_000,        // 100% fee
@@ -208,7 +209,7 @@ mod tests {
             price_fix_duration: SECONDS_IN_DAY,
         };
 
-        let out = calculate_amount_out(
+        let out = calculate_amount_out_from_vector(
             &vector,
             1_000 + 100 * SECONDS_IN_DAY, // base + 100 days
             100_000_000,                  // 100 USDC
@@ -218,7 +219,7 @@ mod tests {
         )
         .unwrap();
 
-        let out_1 = calculate_amount_out(
+        let out_1 = calculate_amount_out_from_vector(
             &vector,
             1_000 + 101 * SECONDS_IN_DAY, // base + 101 days
             100_000_000,                  // 100 USDC
