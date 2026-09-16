@@ -34,6 +34,7 @@ pub const SEED_CIRCULATING_SUPPLY_EXCLUDED_BALANCE: &[u8] = b"circ_supply_excl_b
 pub const SEED_PROP_AMM_PAIR_STATE: &[u8] = b"prop_amm_pair";
 pub const SEED_PROP_AMM_PROCEEDS_VAULT: &[u8] = b"prop_amm_proceeds";
 pub const SEED_PROP_AMM_SELL_FEE_VAULT: &[u8] = b"prop_amm_sell_fee";
+pub const SEED_PROP_AMM_BUY_FEE_VAULT: &[u8] = b"prop_amm_buy_fee";
 
 // Anchor discriminator length
 pub const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
@@ -50,9 +51,5 @@ pub const CIRCULATING_SUPPLY_EXCLUDED_BALANCE_ACCOUNT_DISCRIMINATOR: [u8; 8] =
 // Instruction discriminator for take_offer_permissionless
 pub const TAKE_OFFER_PERMISSIONLESS_DISCRIMINATOR: [u8; 8] = [37, 190, 224, 77, 197, 39, 203, 230];
 
-// v5 instruction discriminators (from target/idl/onreapp.json)
-pub const TAKE_OFFER_PERMISSIONLESS_V2_DISCRIMINATOR: [u8; 8] =
-    [250, 180, 68, 89, 124, 124, 31, 250];
-pub const CREATE_REDEMPTION_REQUEST_DISCRIMINATOR: [u8; 8] = [201, 53, 181, 254, 115, 137, 70, 151];
-pub const QUOTE_SWAP_SELL_DISCRIMINATOR: [u8; 8] = [198, 1, 48, 226, 172, 136, 51, 251];
+pub const OPEN_SWAP_BUY_DISCRIMINATOR: [u8; 8] = [143, 202, 194, 184, 129, 189, 219, 139];
 pub const OPEN_SWAP_SELL_DISCRIMINATOR: [u8; 8] = [93, 206, 188, 72, 45, 138, 181, 71];

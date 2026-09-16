@@ -9,11 +9,7 @@ mod v5_common;
 
 use onre_titan::constants::*;
 use onre_titan::errors::{classify_program_error, ExpectedFailure};
-use onre_titan::redemption::{
-    build_create_redemption_request_instruction, find_redemption_offer_pda,
-    find_redemption_request_pda, redemption_request_status, RedemptionOffer, RedemptionRequest,
-    RedemptionRequestStatus,
-};
+use onre_titan::redemption::RedemptionOffer;
 use onre_titan::trading_venue::{QuoteRequest, SwapType, VenueStatus};
 use solana_instruction::AccountMeta;
 use solana_sdk::signer::Signer;
@@ -21,13 +17,15 @@ use solana_sdk::signer::Signer;
 use v5_common::*;
 
 // ===========================================================================
-// Mint flow (take_offer_permissionless_v2)
+// Atomic RFQ buy flow (open_swap_buy)
 // ===========================================================================
 
 #[test]
 fn test_v2_mint_happy_path_quote_matches_onchain_result() {
     let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 0);
     ctx.setup_sell_side_defaults();
+    create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_PROCEEDS_VAULT, 5);
+    create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_BUY_FEE_VAULT, 3);
 
     let venue = ctx.load_venue();
     assert!(venue.initialized());
@@ -60,7 +58,7 @@ fn test_v2_mint_happy_path_quote_matches_onchain_result() {
 
     let user = ctx.user.insecure_clone();
     ctx.send_ixs(&[ix], &[&user])
-        .expect("v2 take should succeed");
+        .expect("open_swap_buy should succeed");
 
     let user_onyc = ctx.token_balance(&ctx.user.pubkey(), &ctx.onyc_mint);
     assert_eq!(user_onyc, quote.expected_output);
@@ -73,6 +71,8 @@ fn test_v2_mint_happy_path_quote_matches_onchain_result() {
 fn test_v2_mint_routes_fee_to_dedicated_fee_vault() {
     let mut ctx = setup_mint_offer_with_pricing(100, 100, 1_000_000_000, 0); // 1% fee
     ctx.setup_sell_side_defaults();
+    create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_PROCEEDS_VAULT, 5);
+    let buy_fee_vault = create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_BUY_FEE_VAULT, 3);
 
     let venue = ctx.load_venue();
     let amount = 1_000_000;
@@ -101,16 +101,15 @@ fn test_v2_mint_routes_fee_to_dedicated_fee_vault() {
         .unwrap();
     let user = ctx.user.insecure_clone();
     ctx.send_ixs(&[ix], &[&user])
-        .expect("v2 take should succeed");
+        .expect("open_swap_buy should succeed");
 
     assert_eq!(
         ctx.token_balance(&ctx.user.pubkey(), &ctx.onyc_mint),
         quote.expected_output
     );
 
-    // The 1% fee lands in the dedicated permissionless-offer-fee configurable vault ATA
-    let fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERMISSIONLESS_OFFER_FEE_VAULT]);
-    assert_eq!(ctx.token_balance(&fee_vault, &ctx.usdc_mint), 10_000);
+    // The 1% fee lands in the dedicated prop-amm-buy-fee configurable vault ATA
+    assert_eq!(ctx.token_balance(&buy_fee_vault, &ctx.usdc_mint), 10_000);
 }
 
 #[test]
@@ -118,6 +117,8 @@ fn test_v2_mint_quote_matches_onchain_with_apr() {
     // 36.5% APR, price 1.0, no fee.
     let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 365_000);
     ctx.setup_sell_side_defaults();
+    create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_PROCEEDS_VAULT, 5);
+    create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_BUY_FEE_VAULT, 3);
 
     let venue = ctx.load_venue();
     assert_eq!(venue.status(), VenueStatus::Active);
@@ -148,7 +149,7 @@ fn test_v2_mint_quote_matches_onchain_with_apr() {
         .unwrap();
     let user = ctx.user.insecure_clone();
     ctx.send_ixs(&[ix], &[&user])
-        .expect("v2 take should succeed");
+        .expect("open_swap_buy should succeed");
 
     assert_eq!(
         ctx.token_balance(&ctx.user.pubkey(), &ctx.onyc_mint),
@@ -165,6 +166,8 @@ fn test_v2_mint_quote_matches_onchain_with_fee_and_flooring() {
     // 2.5% permissionless fee, price 1.0, 36.5% APR.
     let mut ctx = setup_mint_offer_with_pricing(100, 250, 1_000_000_000, 365_000);
     ctx.setup_sell_side_defaults();
+    create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_PROCEEDS_VAULT, 5);
+    let buy_fee_vault = create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_BUY_FEE_VAULT, 3);
 
     let venue = ctx.load_venue();
     let amount = 3_333_333; // odd input -> ceiling fee + floor division
@@ -193,18 +196,20 @@ fn test_v2_mint_quote_matches_onchain_with_fee_and_flooring() {
         .unwrap();
     let user = ctx.user.insecure_clone();
     ctx.send_ixs(&[ix], &[&user])
-        .expect("v2 take should succeed");
+        .expect("open_swap_buy should succeed");
 
     assert_eq!(
         ctx.token_balance(&ctx.user.pubkey(), &ctx.onyc_mint),
         quote.expected_output
     );
 
-    // Fee routed to the dedicated permissionless-offer-fee vault: the program's
+    // Fee routed to the dedicated prop-amm-buy-fee vault: the program's
     // fee equals what the pricing library computes for the same input.
     let expected_fee = onre_pricing::calculate_fee(amount, 250).unwrap();
-    let fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERMISSIONLESS_OFFER_FEE_VAULT]);
-    assert_eq!(ctx.token_balance(&fee_vault, &ctx.usdc_mint), expected_fee);
+    assert_eq!(
+        ctx.token_balance(&buy_fee_vault, &ctx.usdc_mint),
+        expected_fee
+    );
     // User is debited the full input amount.
     assert_eq!(
         ctx.token_balance(&ctx.user.pubkey(), &ctx.usdc_mint),
@@ -216,6 +221,9 @@ fn test_v2_mint_quote_matches_onchain_with_fee_and_flooring() {
 fn test_v2_instruction_matches_final_canonical_layout() {
     let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 365_000);
     ctx.setup_sell_side_defaults();
+    create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_PROCEEDS_VAULT, 5);
+    create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_BUY_FEE_VAULT, 3);
+
     let venue = ctx.load_venue();
     let amount = 1_000_000u64;
     let ix = venue
@@ -230,50 +238,52 @@ fn test_v2_instruction_matches_final_canonical_layout() {
         )
         .unwrap();
 
-    let mut expected_data = TAKE_OFFER_PERMISSIONLESS_V2_DISCRIMINATOR.to_vec();
+    let mut expected_data = OPEN_SWAP_BUY_DISCRIMINATOR.to_vec();
     expected_data.extend_from_slice(&amount.to_le_bytes());
+    expected_data.extend_from_slice(&0u64.to_le_bytes());
     assert_eq!(ix.data, expected_data);
 
     let vault_authority = pda(&[SEED_OFFER_VAULT_AUTHORITY]);
     let permissionless_authority = pda(&[SEED_PERMISSIONLESS_AUTHORITY]);
+    let prop_amm_pair_state = pda(&[SEED_PROP_AMM_PAIR_STATE, ctx.offer_pda.as_ref()]);
     let redemption_offer = pda(&[
         SEED_REDEMPTION_OFFER,
         ctx.onyc_mint.as_ref(),
         ctx.usdc_mint.as_ref(),
     ]);
     let redemption_vault_authority = pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]);
-    let offer_proceeds_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_OFFER_PROCEEDS_VAULT]);
-    let permissionless_fee_vault =
-        pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERMISSIONLESS_OFFER_FEE_VAULT]);
+    let prop_amm_proceeds_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PROP_AMM_PROCEEDS_VAULT]);
+    let prop_amm_buy_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PROP_AMM_BUY_FEE_VAULT]);
     let reserve_vault_authority = pda(&[SEED_RESERVE_VAULT_AUTHORITY]);
     let management_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_MANAGEMENT_FEE_VAULT]);
     let performance_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERFORMANCE_FEE_VAULT]);
 
     let expected_accounts = vec![
         AccountMeta::new(ctx.offer_pda, false),
+        AccountMeta::new(prop_amm_pair_state, false),
+        AccountMeta::new_readonly(redemption_offer, false),
         AccountMeta::new_readonly(pda(&[SEED_STATE]), false),
         AccountMeta::new_readonly(vault_authority, false),
+        AccountMeta::new_readonly(redemption_vault_authority, false),
         AccountMeta::new(derive_ata(&vault_authority, &ctx.usdc_mint), false),
         AccountMeta::new(derive_ata(&vault_authority, &ctx.onyc_mint), false),
-        AccountMeta::new_readonly(permissionless_authority, false),
-        AccountMeta::new(derive_ata(&permissionless_authority, &ctx.usdc_mint), false),
-        AccountMeta::new(derive_ata(&permissionless_authority, &ctx.onyc_mint), false),
+        AccountMeta::new(
+            derive_ata(&redemption_vault_authority, &ctx.usdc_mint),
+            false,
+        ),
         AccountMeta::new(ctx.usdc_mint, false),
         AccountMeta::new_readonly(TOKEN_PROGRAM, false),
         AccountMeta::new(ctx.onyc_mint, false),
         AccountMeta::new_readonly(TOKEN_PROGRAM, false),
         AccountMeta::new(derive_ata(&ctx.user.pubkey(), &ctx.usdc_mint), false),
         AccountMeta::new(derive_ata(&ctx.user.pubkey(), &ctx.onyc_mint), false),
-        AccountMeta::new_readonly(redemption_offer, false),
-        AccountMeta::new_readonly(redemption_vault_authority, false),
-        AccountMeta::new(
-            derive_ata(&redemption_vault_authority, &ctx.usdc_mint),
-            false,
-        ),
-        AccountMeta::new(offer_proceeds_vault, false),
-        AccountMeta::new(derive_ata(&offer_proceeds_vault, &ctx.usdc_mint), false),
-        AccountMeta::new(permissionless_fee_vault, false),
-        AccountMeta::new(derive_ata(&permissionless_fee_vault, &ctx.usdc_mint), false),
+        AccountMeta::new(prop_amm_proceeds_vault, false),
+        AccountMeta::new(derive_ata(&prop_amm_proceeds_vault, &ctx.usdc_mint), false),
+        AccountMeta::new(prop_amm_buy_fee_vault, false),
+        AccountMeta::new(derive_ata(&prop_amm_buy_fee_vault, &ctx.usdc_mint), false),
+        AccountMeta::new_readonly(permissionless_authority, false),
+        AccountMeta::new(derive_ata(&permissionless_authority, &ctx.usdc_mint), false),
+        AccountMeta::new(derive_ata(&permissionless_authority, &ctx.onyc_mint), false),
         AccountMeta::new_readonly(pda(&[SEED_MINT_AUTHORITY]), false),
         AccountMeta::new(pda(&[SEED_BUFFER_STATE]), false),
         AccountMeta::new(derive_ata(&reserve_vault_authority, &ctx.onyc_mint), false),
@@ -281,6 +291,7 @@ fn test_v2_instruction_matches_final_canonical_layout() {
         AccountMeta::new(derive_ata(&performance_fee_vault, &ctx.onyc_mint), false),
         AccountMeta::new(pda(&[SEED_MARKET_STATS]), false),
         AccountMeta::new_readonly(pda(&[SEED_CIRCULATING_SUPPLY_EXCLUDED_BALANCE]), false),
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS, false),
         AccountMeta::new(ctx.user.pubkey(), true),
         AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false),
         AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
@@ -294,6 +305,8 @@ fn test_v2_permissionless_mint_uses_permissionless_fee_and_vault() {
     // regular 1%, permissionless 3%
     let mut ctx = setup_mint_offer_with_pricing(100, 300, 1_000_000_000, 0);
     ctx.setup_sell_side_defaults();
+    let proceeds_vault = create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_PROCEEDS_VAULT, 5);
+    let buy_fee_vault = create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_BUY_FEE_VAULT, 3);
 
     let venue = ctx.load_venue();
     assert_eq!(venue.offer.fee_basis_points, 100);
@@ -308,7 +321,7 @@ fn test_v2_permissionless_mint_uses_permissionless_fee_and_vault() {
             swap_type: SwapType::ExactIn,
         })
         .unwrap();
-    // The v2 permissionless path uses 3%, not the regular 1% fee.
+    // The permissionless path uses 3%, not the regular 1% fee.
     assert_eq!(quote.expected_output, 970_000_000);
 
     let ix = venue
@@ -324,29 +337,19 @@ fn test_v2_permissionless_mint_uses_permissionless_fee_and_vault() {
         .unwrap();
     let user = ctx.user.insecure_clone();
     ctx.send_ixs(&[ix], &[&user])
-        .expect("v2 take should succeed");
+        .expect("open_swap_buy should succeed");
 
     assert_eq!(
         ctx.token_balance(&ctx.user.pubkey(), &ctx.onyc_mint),
         quote.expected_output
     );
 
-    let permissionless_fee_vault =
-        pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERMISSIONLESS_OFFER_FEE_VAULT]);
-    assert_eq!(
-        ctx.token_balance(&permissionless_fee_vault, &ctx.usdc_mint),
-        30_000
-    );
+    assert_eq!(ctx.token_balance(&buy_fee_vault, &ctx.usdc_mint), 30_000);
 
-    // Regular execution has a different fee lane and must not receive the
-    // permissionless fee.
-    let regular_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, b"offer_fee"]);
-    assert_eq!(
-        ctx.token_balance_or_zero(&regular_fee_vault, &ctx.usdc_mint),
-        0
-    );
+    // The old permissionless-offer-fee vault must not receive anything.
+    let old_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERMISSIONLESS_OFFER_FEE_VAULT]);
+    assert_eq!(ctx.token_balance_or_zero(&old_fee_vault, &ctx.usdc_mint), 0);
 
-    let proceeds_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_OFFER_PROCEEDS_VAULT]);
     assert_eq!(ctx.token_balance(&proceeds_vault, &ctx.usdc_mint), 970_000);
 }
 
@@ -508,69 +511,6 @@ fn test_atomic_sell_quote_matches_onchain_with_fee_and_apr() {
 }
 
 // ===========================================================================
-// Redemption flow (create_redemption_request + status tracking)
-// ===========================================================================
-
-#[test]
-fn test_create_redemption_request_and_read_back_state() {
-    let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 365_000);
-    ctx.setup_redemption_offer_with_fees(20, 25);
-
-    // User holds ONyc to redeem
-    let user_onyc = 2_000_000_000u64;
-    create_token_account(&mut ctx.svm, &ctx.onyc_mint, &ctx.user.pubkey(), user_onyc);
-
-    // Integrator surface: read the redemption offer to get the counter
-    let (redemption_offer_pda, _) = find_redemption_offer_pda(&ctx.onyc_mint, &ctx.usdc_mint);
-    let ro_account = ctx.svm.get_account(&redemption_offer_pda).unwrap();
-    let ro = RedemptionOffer::load(&ro_account.data).unwrap();
-    assert_eq!(ro.request_counter, 0);
-    assert_eq!(ro.fee_basis_points, 20);
-    assert_eq!(ro.fee_basis_points_prop_amm_sell, 25);
-    assert!(!ro.is_disabled());
-
-    let amount = 1_500_000_000u64;
-    let ix = build_create_redemption_request_instruction(
-        &ctx.user.pubkey(),
-        &ctx.onyc_mint,
-        &ctx.usdc_mint,
-        amount,
-        ro.request_counter,
-    );
-    let user = ctx.user.insecure_clone();
-    ctx.send_ixs(&[ix], &[&user])
-        .expect("create_redemption_request should succeed");
-
-    // Read back the request state
-    let (request_pda, _) = find_redemption_request_pda(&redemption_offer_pda, 0);
-    let request_account = ctx.svm.get_account(&request_pda).unwrap();
-    let request = RedemptionRequest::load(&request_account.data).unwrap();
-    assert_eq!(request.offer, redemption_offer_pda);
-    assert_eq!(request.request_id, 0);
-    assert_eq!(request.redeemer, ctx.user.pubkey());
-    assert_eq!(request.amount, amount);
-    assert_eq!(request.fulfilled_amount, 0);
-    assert_eq!(
-        redemption_request_status(Some(&request_account.data)).unwrap(),
-        RedemptionRequestStatus::Pending
-    );
-
-    // The redemption offer advanced its counter and requested amount
-    let ro_account = ctx.svm.get_account(&redemption_offer_pda).unwrap();
-    let ro = RedemptionOffer::load(&ro_account.data).unwrap();
-    assert_eq!(ro.request_counter, 1);
-    assert_eq!(ro.requested_redemptions, amount as u128);
-
-    // Tokens were locked in the redemption vault
-    let vault_authority = pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]);
-    assert_eq!(ctx.token_balance(&vault_authority, &ctx.onyc_mint), amount);
-    assert_eq!(
-        ctx.token_balance(&ctx.user.pubkey(), &ctx.onyc_mint),
-        user_onyc - amount
-    );
-}
-
-// ===========================================================================
 // Error paths: disabled offer + kill switch as expected states
 // ===========================================================================
 
@@ -620,6 +560,9 @@ fn test_disabled_offer_is_surfaced_as_expected_state() {
 fn test_kill_switch_is_surfaced_as_expected_state() {
     let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 365_000);
     ctx.setup_sell_side_defaults();
+    create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_PROCEEDS_VAULT, 5);
+    create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_BUY_FEE_VAULT, 3);
+    create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_SELL_FEE_VAULT, 8);
     create_token_account(
         &mut ctx.svm,
         &ctx.onyc_mint,
@@ -644,7 +587,7 @@ fn test_kill_switch_is_surfaced_as_expected_state() {
         .unwrap();
     assert!(quote.not_enough_liquidity);
 
-    // 2. Mint path fails with the classified kill-switch error
+    // 2. Buy path fails with the classified kill-switch error
     let ix = venue
         .generate_swap_instruction_v2(
             QuoteRequest {
@@ -663,14 +606,18 @@ fn test_kill_switch_is_surfaced_as_expected_state() {
         Some(ExpectedFailure::KillSwitchActivated)
     );
 
-    // 3. Redemption path fails with the same classified state
-    let ix = build_create_redemption_request_instruction(
+    // 3. Sell path fails with the same classified state
+    let ix = build_open_swap_sell_instruction(
         &ctx.user.pubkey(),
         &ctx.onyc_mint,
         &ctx.usdc_mint,
+        &TOKEN_PROGRAM,
+        &TOKEN_PROGRAM,
+        &ctx.offer_pda,
         1_000_000_000,
-        0,
-    );
+        1,
+    )
+    .unwrap();
     let err = ctx.send_ixs(&[ix], &[&user]).unwrap_err();
     assert_eq!(
         custom_error_code(&err).and_then(classify_program_error),
@@ -682,6 +629,17 @@ fn test_kill_switch_is_surfaced_as_expected_state() {
 fn test_disabled_redemption_offer_is_surfaced_as_expected_state() {
     let mut ctx = setup_mint_offer_with_pricing(0, 0, 1_000_000_000, 365_000);
     ctx.setup_redemption_offer();
+
+    let boss = ctx.payer.insecure_clone();
+    let configure_ix = build_configure_prop_amm_ix(&boss.pubkey(), &ctx.usdc_mint, &ctx.onyc_mint);
+    ctx.send_ixs(&[configure_ix], &[&boss])
+        .expect("configure_prop_amm failed");
+
+    create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_PROCEEDS_VAULT, 5);
+    create_configurable_vault(&mut ctx.svm, SEED_PROP_AMM_SELL_FEE_VAULT, 8);
+
+    let redemption_vault_authority = pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]);
+    create_token_account(&mut ctx.svm, &ctx.usdc_mint, &redemption_vault_authority, 0);
     create_token_account(
         &mut ctx.svm,
         &ctx.onyc_mint,
@@ -689,7 +647,6 @@ fn test_disabled_redemption_offer_is_surfaced_as_expected_state() {
         1_000_000_000,
     );
 
-    let boss = ctx.payer.insecure_clone();
     let ix = build_set_redemption_offer_disabled_ix(
         &boss.pubkey(),
         &ctx.onyc_mint,
@@ -699,20 +656,28 @@ fn test_disabled_redemption_offer_is_surfaced_as_expected_state() {
     ctx.send_ixs(&[ix], &[&boss]).unwrap();
 
     // Integrator can read the disabled flag off the account
-    let (redemption_offer_pda, _) = find_redemption_offer_pda(&ctx.onyc_mint, &ctx.usdc_mint);
+    let redemption_offer_pda = pda(&[
+        SEED_REDEMPTION_OFFER,
+        ctx.onyc_mint.as_ref(),
+        ctx.usdc_mint.as_ref(),
+    ]);
     let ro_account = ctx.svm.get_account(&redemption_offer_pda).unwrap();
     assert!(RedemptionOffer::load(&ro_account.data)
         .unwrap()
         .is_disabled());
 
-    // Submitting anyway fails with the classified state
-    let ix = build_create_redemption_request_instruction(
+    // Submitting a sell anyway fails with the classified state
+    let ix = build_open_swap_sell_instruction(
         &ctx.user.pubkey(),
         &ctx.onyc_mint,
         &ctx.usdc_mint,
+        &TOKEN_PROGRAM,
+        &TOKEN_PROGRAM,
+        &ctx.offer_pda,
         1_000_000_000,
-        0,
-    );
+        1,
+    )
+    .unwrap();
     let user = ctx.user.insecure_clone();
     let err = ctx.send_ixs(&[ix], &[&user]).unwrap_err();
     assert_eq!(

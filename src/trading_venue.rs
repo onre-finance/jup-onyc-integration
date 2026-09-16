@@ -1,12 +1,13 @@
 use crate::constants::{
-    AMM_LABEL, ASSOCIATED_TOKEN_PROGRAM, ONRE_PROGRAM_ID, SEED_BUFFER_STATE,
-    SEED_CIRCULATING_SUPPLY_EXCLUDED_BALANCE, SEED_CONFIGURABLE_VAULT, SEED_MANAGEMENT_FEE_VAULT,
-    SEED_MARKET_STATS, SEED_MINT_AUTHORITY, SEED_OFFER, SEED_OFFER_PROCEEDS_VAULT,
-    SEED_OFFER_VAULT_AUTHORITY, SEED_PERFORMANCE_FEE_VAULT, SEED_PERMISSIONLESS_AUTHORITY,
-    SEED_PERMISSIONLESS_OFFER_FEE_VAULT, SEED_PROP_AMM_PAIR_STATE, SEED_REDEMPTION_OFFER,
+    AMM_LABEL, ASSOCIATED_TOKEN_PROGRAM, ONRE_PROGRAM_ID, OPEN_SWAP_BUY_DISCRIMINATOR,
+    OPEN_SWAP_SELL_DISCRIMINATOR, SEED_BUFFER_STATE, SEED_CIRCULATING_SUPPLY_EXCLUDED_BALANCE,
+    SEED_CONFIGURABLE_VAULT, SEED_MANAGEMENT_FEE_VAULT, SEED_MARKET_STATS, SEED_MINT_AUTHORITY,
+    SEED_OFFER, SEED_OFFER_VAULT_AUTHORITY, SEED_PERFORMANCE_FEE_VAULT,
+    SEED_PERMISSIONLESS_AUTHORITY, SEED_PROP_AMM_BUY_FEE_VAULT, SEED_PROP_AMM_PAIR_STATE,
+    SEED_PROP_AMM_PROCEEDS_VAULT, SEED_PROP_AMM_SELL_FEE_VAULT, SEED_REDEMPTION_OFFER,
     SEED_REDEMPTION_OFFER_VAULT_AUTHORITY, SEED_RESERVE_VAULT_AUTHORITY, SEED_STATE,
-    SYSTEM_PROGRAM, SYSVAR_INSTRUCTIONS, TAKE_OFFER_PERMISSIONLESS_DISCRIMINATOR,
-    TAKE_OFFER_PERMISSIONLESS_V2_DISCRIMINATOR, TOKEN_22_PROGRAM, TOKEN_PROGRAM,
+    SYSTEM_PROGRAM, SYSVAR_INSTRUCTIONS, TAKE_OFFER_PERMISSIONLESS_DISCRIMINATOR, TOKEN_22_PROGRAM,
+    TOKEN_PROGRAM,
 };
 use crate::errors::OnreError;
 use crate::prop_amm::PropAmmPairState;
@@ -666,28 +667,31 @@ impl OnreVenue {
         })
     }
 
-    /// Generate the v5 swap instruction (`take_offer_permissionless_v2`).
-    ///
-    /// The v5 permissionless take routes proceeds/fees to dedicated
-    /// configurable-vault PDAs, refills the redemption vault, accrues the
-    /// ONyc buffer, and refreshes the market-stats PDA. All PDAs are derived
-    /// per the v5 IDL. This instruction has neither an approval-message
-    /// argument nor an Instructions sysvar account.
+    /// Generate the v5 swap instruction (`open_swap_buy` / `open_swap_sell`).
     pub fn generate_swap_instruction_v2(
         &self,
         request: QuoteRequest,
         user: Pubkey,
     ) -> Result<Instruction, OnreError> {
         let state = self.state.as_ref().ok_or(OnreError::StateMissing)?;
+        let direction = self.swap_direction(&request)?;
 
-        let token_in_info = self.get_token(0)?;
-        let token_out_info = self.get_token(1)?;
+        let (token_in_info, token_out_info) = match direction {
+            SwapDirection::Buy => (self.get_token(0)?, self.get_token(1)?),
+            SwapDirection::Sell => (self.get_token(1)?, self.get_token(0)?),
+        };
         let token_in_mint = token_in_info.pubkey;
         let token_out_mint = token_out_info.pubkey;
         let token_in_program = token_in_info.get_token_program();
         let token_out_program = token_out_info.get_token_program();
 
+        let onyc_mint = self.get_token(1)?.pubkey;
+        let onyc_program = self.get_token(1)?.get_token_program();
+
         let pda = |seeds: &[&[u8]]| Pubkey::find_program_address(seeds, &ONRE_PROGRAM_ID).0;
+        let ata = |owner: &Pubkey, mint: &Pubkey, program: &Pubkey| {
+            get_associated_token_address_with_program_id(owner, mint, program)
+        };
 
         let offer_pda = pda(&[SEED_OFFER, token_in_mint.as_ref(), token_out_mint.as_ref()]);
         let state_pda = pda(&[SEED_STATE]);
@@ -695,111 +699,185 @@ impl OnreVenue {
         let permissionless_authority = pda(&[SEED_PERMISSIONLESS_AUTHORITY]);
         let mint_authority = pda(&[SEED_MINT_AUTHORITY]);
         // Redemption offer for the opposite direction (ONyc -> token_in)
+        // Shared PDAs (offer/redemption always use the canonical offer mint order)
+        let offer_pda = pda(&[
+            SEED_OFFER,
+            self.offer.token_in_mint.as_ref(),
+            self.offer.token_out_mint.as_ref(),
+        ]);
+        let prop_amm_pair_state = pda(&[SEED_PROP_AMM_PAIR_STATE, offer_pda.as_ref()]);
         let redemption_offer = pda(&[
             SEED_REDEMPTION_OFFER,
-            token_out_mint.as_ref(),
-            token_in_mint.as_ref(),
+            self.offer.token_out_mint.as_ref(),
+            self.offer.token_in_mint.as_ref(),
         ]);
+        let state_pda = pda(&[SEED_STATE]);
+        let offer_vault_authority = pda(&[SEED_OFFER_VAULT_AUTHORITY]);
         let redemption_vault_authority = pda(&[SEED_REDEMPTION_OFFER_VAULT_AUTHORITY]);
-        let offer_proceeds_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_OFFER_PROCEEDS_VAULT]);
-        let permissionless_offer_fee_vault =
-            pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERMISSIONLESS_OFFER_FEE_VAULT]);
-        let management_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_MANAGEMENT_FEE_VAULT]);
-        let performance_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERFORMANCE_FEE_VAULT]);
+        let prop_amm_proceeds_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PROP_AMM_PROCEEDS_VAULT]);
+        let mint_authority = pda(&[SEED_MINT_AUTHORITY]);
         let buffer_state = pda(&[SEED_BUFFER_STATE]);
         let reserve_vault_authority = pda(&[SEED_RESERVE_VAULT_AUTHORITY]);
+        let management_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_MANAGEMENT_FEE_VAULT]);
+        let performance_fee_vault = pda(&[SEED_CONFIGURABLE_VAULT, SEED_PERFORMANCE_FEE_VAULT]);
         let market_stats = pda(&[SEED_MARKET_STATS]);
         let excluded_balance = pda(&[SEED_CIRCULATING_SUPPLY_EXCLUDED_BALANCE]);
 
-        let ata = |owner: &Pubkey, mint: &Pubkey, program: &Pubkey| {
-            get_associated_token_address_with_program_id(owner, mint, program)
+        let (discriminator, accounts) = match direction {
+            SwapDirection::Buy => {
+                let prop_amm_buy_fee_vault =
+                    pda(&[SEED_CONFIGURABLE_VAULT, SEED_PROP_AMM_BUY_FEE_VAULT]);
+                let permissionless_authority = pda(&[SEED_PERMISSIONLESS_AUTHORITY]);
+
+                let accounts = vec![
+                    AccountMeta::new(offer_pda, false),
+                    AccountMeta::new(prop_amm_pair_state, false),
+                    AccountMeta::new_readonly(redemption_offer, false),
+                    AccountMeta::new_readonly(state_pda, false),
+                    AccountMeta::new_readonly(offer_vault_authority, false),
+                    AccountMeta::new_readonly(redemption_vault_authority, false),
+                    AccountMeta::new(
+                        ata(&offer_vault_authority, &token_in_mint, &token_in_program),
+                        false,
+                    ),
+                    AccountMeta::new(
+                        ata(&offer_vault_authority, &token_out_mint, &token_out_program),
+                        false,
+                    ),
+                    AccountMeta::new(
+                        ata(
+                            &redemption_vault_authority,
+                            &token_in_mint,
+                            &token_in_program,
+                        ),
+                        false,
+                    ),
+                    AccountMeta::new(token_in_mint, false),
+                    AccountMeta::new_readonly(token_in_program, false),
+                    AccountMeta::new(token_out_mint, false),
+                    AccountMeta::new_readonly(token_out_program, false),
+                    AccountMeta::new(ata(&user, &token_in_mint, &token_in_program), false),
+                    AccountMeta::new(ata(&user, &token_out_mint, &token_out_program), false),
+                    AccountMeta::new(prop_amm_proceeds_vault, false),
+                    AccountMeta::new(
+                        ata(&prop_amm_proceeds_vault, &token_in_mint, &token_in_program),
+                        false,
+                    ),
+                    AccountMeta::new(prop_amm_buy_fee_vault, false),
+                    AccountMeta::new(
+                        ata(&prop_amm_buy_fee_vault, &token_in_mint, &token_in_program),
+                        false,
+                    ),
+                    AccountMeta::new_readonly(permissionless_authority, false),
+                    AccountMeta::new(
+                        ata(&permissionless_authority, &token_in_mint, &token_in_program),
+                        false,
+                    ),
+                    AccountMeta::new(
+                        ata(
+                            &permissionless_authority,
+                            &token_out_mint,
+                            &token_out_program,
+                        ),
+                        false,
+                    ),
+                    AccountMeta::new_readonly(mint_authority, false),
+                    // BufferAccrualAccounts
+                    AccountMeta::new(buffer_state, false),
+                    AccountMeta::new(
+                        ata(&reserve_vault_authority, &onyc_mint, &onyc_program),
+                        false,
+                    ),
+                    AccountMeta::new(ata(&management_fee_vault, &onyc_mint, &onyc_program), false),
+                    AccountMeta::new(
+                        ata(&performance_fee_vault, &onyc_mint, &onyc_program),
+                        false,
+                    ),
+                    AccountMeta::new(market_stats, false),
+                    AccountMeta::new_readonly(excluded_balance, false),
+                    AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS, false),
+                    AccountMeta::new(user, true),
+                    AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false),
+                    AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+                    AccountMeta::new_readonly(state.main_offer, false),
+                ];
+                (OPEN_SWAP_BUY_DISCRIMINATOR, accounts)
+            }
+            SwapDirection::Sell => {
+                let prop_amm_sell_fee_vault =
+                    pda(&[SEED_CONFIGURABLE_VAULT, SEED_PROP_AMM_SELL_FEE_VAULT]);
+
+                let accounts = vec![
+                    AccountMeta::new(offer_pda, false),
+                    AccountMeta::new(prop_amm_pair_state, false),
+                    AccountMeta::new_readonly(redemption_offer, false),
+                    AccountMeta::new_readonly(state_pda, false),
+                    AccountMeta::new_readonly(offer_vault_authority, false),
+                    AccountMeta::new_readonly(redemption_vault_authority, false),
+                    AccountMeta::new(
+                        ata(
+                            &redemption_vault_authority,
+                            &token_in_mint,
+                            &token_in_program,
+                        ),
+                        false,
+                    ),
+                    AccountMeta::new(
+                        ata(
+                            &redemption_vault_authority,
+                            &token_out_mint,
+                            &token_out_program,
+                        ),
+                        false,
+                    ),
+                    AccountMeta::new(token_in_mint, false),
+                    AccountMeta::new_readonly(token_in_program, false),
+                    AccountMeta::new(token_out_mint, false),
+                    AccountMeta::new_readonly(token_out_program, false),
+                    AccountMeta::new(ata(&user, &token_in_mint, &token_in_program), false),
+                    AccountMeta::new(ata(&user, &token_out_mint, &token_out_program), false),
+                    AccountMeta::new(prop_amm_proceeds_vault, false),
+                    AccountMeta::new(
+                        ata(&prop_amm_proceeds_vault, &token_in_mint, &token_in_program),
+                        false,
+                    ),
+                    AccountMeta::new(prop_amm_sell_fee_vault, false),
+                    AccountMeta::new(
+                        ata(&prop_amm_sell_fee_vault, &token_in_mint, &token_in_program),
+                        false,
+                    ),
+                    AccountMeta::new_readonly(mint_authority, false),
+                    // BufferAccrualAccounts
+                    AccountMeta::new(buffer_state, false),
+                    AccountMeta::new(
+                        ata(&reserve_vault_authority, &onyc_mint, &onyc_program),
+                        false,
+                    ),
+                    AccountMeta::new(ata(&management_fee_vault, &onyc_mint, &onyc_program), false),
+                    AccountMeta::new(
+                        ata(&performance_fee_vault, &onyc_mint, &onyc_program),
+                        false,
+                    ),
+                    AccountMeta::new(market_stats, false),
+                    AccountMeta::new_readonly(excluded_balance, false),
+                    AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS, false),
+                    AccountMeta::new(user, true),
+                    AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false),
+                    AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+                    AccountMeta::new_readonly(state.main_offer, false),
+                    AccountMeta::new_readonly(
+                        ata(&offer_vault_authority, &onyc_mint, &onyc_program),
+                        false,
+                    ),
+                ];
+                (OPEN_SWAP_SELL_DISCRIMINATOR, accounts)
+            }
         };
 
-        // Build instruction data: discriminator + amount (u64)
-        let mut data = Vec::with_capacity(16);
-        data.extend_from_slice(&TAKE_OFFER_PERMISSIONLESS_V2_DISCRIMINATOR);
-        data.extend_from_slice(&request.amount.to_le_bytes());
-
-        let accounts = vec![
-            AccountMeta::new(offer_pda, false),
-            AccountMeta::new_readonly(state_pda, false),
-            AccountMeta::new_readonly(vault_authority, false),
-            AccountMeta::new(
-                ata(&vault_authority, &token_in_mint, &token_in_program),
-                false,
-            ),
-            AccountMeta::new(
-                ata(&vault_authority, &token_out_mint, &token_out_program),
-                false,
-            ),
-            AccountMeta::new_readonly(permissionless_authority, false),
-            AccountMeta::new(
-                ata(&permissionless_authority, &token_in_mint, &token_in_program),
-                false,
-            ),
-            AccountMeta::new(
-                ata(
-                    &permissionless_authority,
-                    &token_out_mint,
-                    &token_out_program,
-                ),
-                false,
-            ),
-            AccountMeta::new(token_in_mint, false),
-            AccountMeta::new_readonly(token_in_program, false),
-            AccountMeta::new(token_out_mint, false),
-            AccountMeta::new_readonly(token_out_program, false),
-            AccountMeta::new(ata(&user, &token_in_mint, &token_in_program), false),
-            AccountMeta::new(ata(&user, &token_out_mint, &token_out_program), false),
-            AccountMeta::new_readonly(redemption_offer, false),
-            AccountMeta::new_readonly(redemption_vault_authority, false),
-            AccountMeta::new(
-                ata(
-                    &redemption_vault_authority,
-                    &token_in_mint,
-                    &token_in_program,
-                ),
-                false,
-            ),
-            AccountMeta::new(offer_proceeds_vault, false),
-            AccountMeta::new(
-                ata(&offer_proceeds_vault, &token_in_mint, &token_in_program),
-                false,
-            ),
-            AccountMeta::new(permissionless_offer_fee_vault, false),
-            AccountMeta::new(
-                ata(
-                    &permissionless_offer_fee_vault,
-                    &token_in_mint,
-                    &token_in_program,
-                ),
-                false,
-            ),
-            AccountMeta::new_readonly(mint_authority, false),
-            AccountMeta::new(buffer_state, false),
-            AccountMeta::new(
-                ata(
-                    &reserve_vault_authority,
-                    &token_out_mint,
-                    &token_out_program,
-                ),
-                false,
-            ),
-            AccountMeta::new(
-                ata(&management_fee_vault, &token_out_mint, &token_out_program),
-                false,
-            ),
-            AccountMeta::new(
-                ata(&performance_fee_vault, &token_out_mint, &token_out_program),
-                false,
-            ),
-            AccountMeta::new(market_stats, false),
-            AccountMeta::new_readonly(excluded_balance, false),
-            AccountMeta::new(user, true),
-            AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
-            AccountMeta::new_readonly(state.main_offer, false),
-        ];
+        let mut data = Vec::with_capacity(24);
+        data.extend_from_slice(&discriminator);
+        data.extend_from_slice(&request.amount.to_le_bytes()); // amount
+        data.extend_from_slice(&0u64.to_le_bytes()); // minimum_out
 
         Ok(Instruction {
             program_id: ONRE_PROGRAM_ID,
@@ -937,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_swap_instruction_data_layout() {
+    fn test_v2_swap_instruction_data_layout_buy() {
         let venue = test_venue(Pubkey::new_unique(), Pubkey::new_unique());
         let user = Pubkey::new_unique();
 
@@ -954,14 +1032,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(ix.program_id, ONRE_PROGRAM_ID);
-        // discriminator (from v5 IDL) + u64 amount
-        let mut expected = vec![250u8, 180, 68, 89, 124, 124, 31, 250];
+        let mut expected = OPEN_SWAP_BUY_DISCRIMINATOR.to_vec();
         expected.extend_from_slice(&1_000_100u64.to_le_bytes());
+        expected.extend_from_slice(&0u64.to_le_bytes());
         assert_eq!(ix.data, expected);
     }
 
     #[test]
-    fn test_v2_swap_instruction_account_list() {
+    fn test_v2_swap_instruction_data_layout_sell() {
+        let venue = test_venue(Pubkey::new_unique(), Pubkey::new_unique());
+        let user = Pubkey::new_unique();
+
+        let ix = venue
+            .generate_swap_instruction_v2(
+                QuoteRequest {
+                    input_mint: venue.offer.token_out_mint,
+                    output_mint: venue.offer.token_in_mint,
+                    amount: 500_000,
+                    swap_type: SwapType::ExactIn,
+                },
+                user,
+            )
+            .unwrap();
+
+        assert_eq!(ix.program_id, ONRE_PROGRAM_ID);
+        let mut expected = OPEN_SWAP_SELL_DISCRIMINATOR.to_vec();
+        expected.extend_from_slice(&500_000u64.to_le_bytes());
+        expected.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(ix.data, expected);
+    }
+
+    #[test]
+    fn test_v2_buy_instruction_account_list() {
         let token_in_mint = Pubkey::new_unique();
         let token_out_mint = Pubkey::new_unique();
         let venue = test_venue(token_in_mint, token_out_mint);
@@ -979,27 +1081,26 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(ix.accounts.len(), 32);
+        assert_eq!(ix.accounts.len(), 34);
 
-        // Independent PDA derivations with literal seeds (from the v5 IDL)
         let pda = |seeds: &[&[u8]]| Pubkey::find_program_address(seeds, &ONRE_PROGRAM_ID).0;
         let ata = |owner: &Pubkey, mint: &Pubkey| {
             get_associated_token_address_with_program_id(owner, mint, &TOKEN_PROGRAM)
         };
 
         let offer_pda = pda(&[b"offer", token_in_mint.as_ref(), token_out_mint.as_ref()]);
-        let state_pda = pda(&[b"state"]);
-        let vault_authority = pda(&[b"offer_vault_authority"]);
-        let permissionless_authority = pda(&[b"permissionless-1"]);
+        let pair_state = pda(&[b"prop_amm_pair", offer_pda.as_ref()]);
         let redemption_offer = pda(&[
             b"redemption_offer",
             token_out_mint.as_ref(),
             token_in_mint.as_ref(),
         ]);
+        let state_pda = pda(&[b"state"]);
+        let vault_authority = pda(&[b"offer_vault_authority"]);
         let redemption_vault_authority = pda(&[b"redemption_offer_vault_authority"]);
-        let proceeds_vault = pda(&[b"configurable_vault", b"offer_proceeds"]);
-        let permissionless_offer_fee_vault =
-            pda(&[b"configurable_vault", b"permissionless_offer_fee"]);
+        let proceeds_vault = pda(&[b"configurable_vault", b"prop_amm_proceeds"]);
+        let buy_fee_vault = pda(&[b"configurable_vault", b"prop_amm_buy_fee"]);
+        let permissionless_authority = pda(&[b"permissionless-1"]);
         let mint_authority = pda(&[b"mint_authority"]);
         let buffer_state = pda(&[b"buffer_state"]);
         let reserve_vault_authority = pda(&[b"reserve_vault_authority"]);
@@ -1010,34 +1111,31 @@ mod tests {
 
         let expected: Vec<(Pubkey, bool, bool)> = vec![
             (offer_pda, true, false),
+            (pair_state, true, false),
+            (redemption_offer, false, false),
             (state_pda, false, false),
             (vault_authority, false, false),
+            (redemption_vault_authority, false, false),
             (ata(&vault_authority, &token_in_mint), true, false),
             (ata(&vault_authority, &token_out_mint), true, false),
-            (permissionless_authority, false, false),
-            (ata(&permissionless_authority, &token_in_mint), true, false),
-            (ata(&permissionless_authority, &token_out_mint), true, false),
+            (
+                ata(&redemption_vault_authority, &token_in_mint),
+                true,
+                false,
+            ),
             (token_in_mint, true, false),
             (TOKEN_PROGRAM, false, false),
             (token_out_mint, true, false),
             (TOKEN_PROGRAM, false, false),
             (ata(&user, &token_in_mint), true, false),
             (ata(&user, &token_out_mint), true, false),
-            (redemption_offer, false, false),
-            (redemption_vault_authority, false, false),
-            (
-                ata(&redemption_vault_authority, &token_in_mint),
-                true,
-                false,
-            ),
             (proceeds_vault, true, false),
             (ata(&proceeds_vault, &token_in_mint), true, false),
-            (permissionless_offer_fee_vault, true, false),
-            (
-                ata(&permissionless_offer_fee_vault, &token_in_mint),
-                true,
-                false,
-            ),
+            (buy_fee_vault, true, false),
+            (ata(&buy_fee_vault, &token_in_mint), true, false),
+            (permissionless_authority, false, false),
+            (ata(&permissionless_authority, &token_in_mint), true, false),
+            (ata(&permissionless_authority, &token_out_mint), true, false),
             (mint_authority, false, false),
             (buffer_state, true, false),
             (ata(&reserve_vault_authority, &token_out_mint), true, false),
@@ -1045,22 +1143,139 @@ mod tests {
             (ata(&performance_fee_vault, &token_out_mint), true, false),
             (market_stats, true, false),
             (excluded_balance, false, false),
+            (SYSVAR_INSTRUCTIONS, false, false),
             (user, true, true),
             (ASSOCIATED_TOKEN_PROGRAM, false, false),
             (SYSTEM_PROGRAM, false, false),
-            (offer_pda, false, false), // main_offer from state.main_offer
+            (offer_pda, false, false),
         ];
 
         for (i, (key, writable, signer)) in expected.iter().enumerate() {
-            assert_eq!(ix.accounts[i].pubkey, *key, "account {} pubkey mismatch", i);
+            assert_eq!(
+                ix.accounts[i].pubkey, *key,
+                "buy account {} pubkey mismatch",
+                i
+            );
             assert_eq!(
                 ix.accounts[i].is_writable, *writable,
-                "account {} writable mismatch",
+                "buy account {} writable mismatch",
                 i
             );
             assert_eq!(
                 ix.accounts[i].is_signer, *signer,
-                "account {} signer mismatch",
+                "buy account {} signer mismatch",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_v2_sell_instruction_account_list() {
+        let token_in_mint = Pubkey::new_unique();
+        let token_out_mint = Pubkey::new_unique();
+        let venue = test_venue(token_in_mint, token_out_mint);
+        let user = Pubkey::new_unique();
+
+        // Sell: input is token_out (ONyc), output is token_in (asset)
+        let ix = venue
+            .generate_swap_instruction_v2(
+                QuoteRequest {
+                    input_mint: token_out_mint,
+                    output_mint: token_in_mint,
+                    amount: 5,
+                    swap_type: SwapType::ExactIn,
+                },
+                user,
+            )
+            .unwrap();
+
+        assert_eq!(ix.accounts.len(), 31);
+
+        let pda = |seeds: &[&[u8]]| Pubkey::find_program_address(seeds, &ONRE_PROGRAM_ID).0;
+        let ata = |owner: &Pubkey, mint: &Pubkey| {
+            get_associated_token_address_with_program_id(owner, mint, &TOKEN_PROGRAM)
+        };
+
+        let offer_pda = pda(&[b"offer", token_in_mint.as_ref(), token_out_mint.as_ref()]);
+        let pair_state = pda(&[b"prop_amm_pair", offer_pda.as_ref()]);
+        let redemption_offer = pda(&[
+            b"redemption_offer",
+            token_out_mint.as_ref(),
+            token_in_mint.as_ref(),
+        ]);
+        let state_pda = pda(&[b"state"]);
+        let vault_authority = pda(&[b"offer_vault_authority"]);
+        let redemption_vault_authority = pda(&[b"redemption_offer_vault_authority"]);
+        let proceeds_vault = pda(&[b"configurable_vault", b"prop_amm_proceeds"]);
+        let sell_fee_vault = pda(&[b"configurable_vault", b"prop_amm_sell_fee"]);
+        let mint_authority = pda(&[b"mint_authority"]);
+        let buffer_state = pda(&[b"buffer_state"]);
+        let reserve_vault_authority = pda(&[b"reserve_vault_authority"]);
+        let management_fee_vault = pda(&[b"configurable_vault", b"management_fee"]);
+        let performance_fee_vault = pda(&[b"configurable_vault", b"performance_fee"]);
+        let market_stats = pda(&[b"market_stats"]);
+        let excluded_balance = pda(&[b"circ_supply_excl_balance"]);
+
+        // For sell: token_in = ONyc (token_out_mint), token_out = asset (token_in_mint)
+        let sell_token_in = token_out_mint;
+        let sell_token_out = token_in_mint;
+
+        let expected: Vec<(Pubkey, bool, bool)> = vec![
+            (offer_pda, true, false),
+            (pair_state, true, false),
+            (redemption_offer, false, false),
+            (state_pda, false, false),
+            (vault_authority, false, false),
+            (redemption_vault_authority, false, false),
+            (
+                ata(&redemption_vault_authority, &sell_token_in),
+                true,
+                false,
+            ),
+            (
+                ata(&redemption_vault_authority, &sell_token_out),
+                true,
+                false,
+            ),
+            (sell_token_in, true, false),
+            (TOKEN_PROGRAM, false, false),
+            (sell_token_out, true, false),
+            (TOKEN_PROGRAM, false, false),
+            (ata(&user, &sell_token_in), true, false),
+            (ata(&user, &sell_token_out), true, false),
+            (proceeds_vault, true, false),
+            (ata(&proceeds_vault, &sell_token_in), true, false),
+            (sell_fee_vault, true, false),
+            (ata(&sell_fee_vault, &sell_token_in), true, false),
+            (mint_authority, false, false),
+            (buffer_state, true, false),
+            (ata(&reserve_vault_authority, &sell_token_in), true, false),
+            (ata(&management_fee_vault, &sell_token_in), true, false),
+            (ata(&performance_fee_vault, &sell_token_in), true, false),
+            (market_stats, true, false),
+            (excluded_balance, false, false),
+            (SYSVAR_INSTRUCTIONS, false, false),
+            (user, true, true),
+            (ASSOCIATED_TOKEN_PROGRAM, false, false),
+            (SYSTEM_PROGRAM, false, false),
+            (offer_pda, false, false),
+            (ata(&vault_authority, &sell_token_in), false, false),
+        ];
+
+        for (i, (key, writable, signer)) in expected.iter().enumerate() {
+            assert_eq!(
+                ix.accounts[i].pubkey, *key,
+                "sell account {} pubkey mismatch",
+                i
+            );
+            assert_eq!(
+                ix.accounts[i].is_writable, *writable,
+                "sell account {} writable mismatch",
+                i
+            );
+            assert_eq!(
+                ix.accounts[i].is_signer, *signer,
+                "sell account {} signer mismatch",
                 i
             );
         }
