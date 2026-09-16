@@ -5,20 +5,21 @@ Titan integration primitives for OnRe's ONyc/USDG liquidity layer.
 ## Overview
 
 This crate builds the v5 instructions Titan needs to route users in both
-directions: USDG -> ONyc through the permissionless mint path and ONyc -> USDG
-through the atomic proprietary-AMM sell path.
+directions: USDG → ONyc through the Prop AMM buy path and ONyc -> USDG
+through the atomic Prop AMM sell path.
 
 The local `TradingVenue` interface is an integration scaffold, not Titan's
 published production trait. The final adapter still needs to connect Titan's
-quote simulator/return-data boundary to the primitives in `prop_amm.rs`.
+quote simulator/return-data boundary to the state deserialization and parameter
+extraction in `prop_amm.rs`.
 
 ## Features
 
-- **Bidirectional primitives**: USDG -> ONyc minting and atomic ONyc -> USDG sells
-- **Time-based pricing**: APR-based discrete interval pricing model
-- **Liquidity-aware sells**: Quotes reflect redemption-vault liquidity and Prop AMM controls
+- **Bidirectional primitives**: USDG → ONyc minting and atomic ONyc → USDG sells
+- **Time-based pricing**: APR-based daily-compounded interval pricing model
+- **Liquidity-aware sells**: Quotes reflect redemption-vault liquidity, dampening curves, and Prop AMM controls
 - **Protected execution**: Sells recompute on chain and enforce `minimum_out`
-- **v5 permissionless minting**: Uses `take_offer_permissionless_v2`
+- **Prop AMM buy/sell**: Uses `open_swap_buy` and `open_swap_sell`
 
 ## Key Components
 
@@ -50,13 +51,21 @@ let ix = venue.generate_swap_instruction_v2(request, user_pubkey)?;
 
 ## Pricing Model
 
-OnRe uses APR-based discrete interval pricing:
+OnRe uses APR-based daily-compounded pricing with discrete interval snapping:
 
 ```
-interval = floor((current_time - base_time) / price_fix_duration)
-step_end_time = (interval + 1) * price_fix_duration
-price = base_price * (1 + apr * step_end_time / SECONDS_IN_YEAR)
+Step snapping:
+  interval = floor((current_time - base_time) / price_fix_duration)
+  step_end_time = (interval + 1) * price_fix_duration
+
+Daily-compounded price at step_end_time:
+  daily_factor = 1 + apr / (APR_SCALE * 365)
+  full_day_price = base_price * daily_factor ^ floor(elapsed / 86400)
+  price = full_day_price + daily_delta * (elapsed % 86400) / 86400
 ```
+
+Where `daily_delta = next_day_price - full_day_price` provides linear
+interpolation for sub-day precision.
 
 ### APR Scale
 
@@ -65,88 +74,78 @@ price = base_price * (1 + apr * step_end_time / SECONDS_IN_YEAR)
 - 5% APR = 50,000
 - 36.5% APR = 365,000
 
+## `onre-pricing` crate
+
+The workspace includes `onre-pricing` (`crates/onre-pricing`), a zero-dependency
+`#![no_std]` pricing math library (v0.1.0, Rust 1.85+).
+
+| Module | Purpose |
+|--------|---------|
+| `buy` | Buy-side amount calculation (`calculate_amount_out`) |
+| `sell` | Sell-side amount calculation with liquidity dampening and hard wall mechanics |
+| `pricing` | Vector selection, step price calculation, daily-compounded price growth, fee math |
+| `types` | `PriceVector`, `DampeningState`, `LiquidityParams` |
+| `hard_wall_math` | Dynamic wall position, redemption haircut, Q40 fixed-point exponentiation |
+| `constants` | `APR_SCALE`, `PRICE_DECIMALS`, `MAX_VECTORS`, `MAX_BASIS_POINTS`, `SECONDS_IN_DAY` |
+| `error` | `PricingError` enum |
+
+Used by `onre-titan` for both buy quotes (`onre_pricing::buy::calculate_amount_out`)
+and sell quotes (`onre_pricing::sell::calculate_amount_out`).
+
 ## Program Info
 
 | Property | Value |
 |----------|-------|
 | Program ID | `onreuGhHHgVzMWSkj2oQDLDtvvGvoepBPkqyaubFcwe` |
 | Legacy mint (deprecated) | `take_offer_permissionless` `[37, 190, 224, 77, 197, 39, 203, 230]` |
-| Mint (v5) | `take_offer_permissionless_v2` `[250, 180, 68, 89, 124, 124, 31, 250]` |
-| Atomic sell quote (v5) | `quote_swap_sell` `[198, 1, 48, 226, 172, 136, 51, 251]` |
-| Atomic sell execution (v5) | `open_swap_sell` `[93, 206, 188, 72, 45, 138, 181, 71]` |
-| Async redemption request (v5) | `create_redemption_request` `[201, 53, 181, 254, 115, 137, 70, 151]` |
+| Buy (v5) | `open_swap_buy` `[143, 202, 194, 184, 129, 189, 219, 139]` |
+| Sell (v5) | `open_swap_sell` `[93, 206, 188, 72, 45, 138, 181, 71]` |
 
 ## v5 Flows
 
-### Buy ONyc (`take_offer_permissionless_v2`)
+### Buy ONyc (`open_swap_buy`)
 
-`OnreVenue::generate_swap_instruction_v2` builds the v5 permissionless take
-with the full 32-account list: dedicated proceeds/fee configurable-vault PDAs,
-redemption vault refill accounts, ONyc buffer accrual accounts, `market_stats`,
-the circulating-supply excluded balance PDA and `state.main_offer`. The
-instruction has no approval-message argument or Instructions sysvar. It uses
-the offer's permissionless fee, not the regular-offer fee.
+`OnreVenue::generate_swap_instruction_v2` builds the v5 Prop AMM buy
+instruction with a 34-account list: offer and pair state PDAs, redemption offer,
+state, vault authorities, offer/redemption vault ATAs, mint accounts, user ATAs,
+Prop AMM proceeds and buy-fee configurable vaults, permissionless authority + ATAs,
+mint authority, buffer accrual accounts (buffer state, reserve/management/performance
+fee vault ATAs), `market_stats`, circulating-supply excluded balance PDA, and
+`state.main_offer`.
 
-This is the supported transitional buy path. The protocol also exposes
-`quote_swap_buy`/`open_swap_buy`; moving the adapter to that pair is follow-up
-work so buy volume updates the same Prop AMM pressure tracker as sells.
+Instruction data: `discriminator(8) + amount(u64) + minimum_out(u64)` = 24 bytes.
 
-### Sell ONyc atomically (`quote_swap_sell` + `open_swap_sell`)
+### Sell ONyc (`open_swap_sell`)
 
-The router simulates the quote instruction, validates the returned program id
-and exact 152-byte Borsh payload, and binds it to the expected offer, mints and
-input amount:
+Sell instructions are generated by the same `generate_swap_instruction_v2` method
+when the input mint is ONyc and the output mint is the asset (USDG). The sell
+path builds a 31-account instruction using Prop AMM proceeds and sell-fee vaults
+instead of buy-fee vaults, and includes the offer vault ONyc ATA as a trailing
+read-only account.
 
-```rust
-use onre_titan::prop_amm::*;
+Titan's quote simulator handles the on-chain quote side. Off-chain,
+`OnreVenue::quote()` provides quotes via `onre_pricing::sell::calculate_amount_out`,
+which factors in redemption-vault liquidity, dampening curves, and hard wall
+mechanics.
 
-let quote_ix = build_quote_swap_sell_instruction(
-    &onyc_mint, &usdg_mint, &usdg_token_program, amount,
-)?;
-
-// Titan supplies these values from transaction simulation.
-let quote = parse_swap_sell_quote(
-    &return_data_program, &return_data, &onyc_mint, &usdg_mint, amount,
-)?;
-
-let sell_ix = build_open_swap_sell_instruction(
-    &user,
-    &onyc_mint,
-    &usdg_mint,
-    &onyc_token_program,
-    &usdg_token_program,
-    &state_main_offer,
-    &quote,
-)?;
-```
-
-Never replace the quote's `minimum_out` with zero. `quoted_at` is
-informational; execution recalculates price, liquidity and fees, and reverts if
-the protected output cannot be met.
+Never replace the quote's `minimum_out` with zero. Execution recalculates
+price, liquidity and fees on chain, and reverts if the protected output
+cannot be met.
 
 ### Async redemption (separate from router swaps)
 
-`create_redemption_request` locks ONyc and waits for protocol-side fulfillment.
-It is not an atomic swap and must not be exposed as Titan's sell route:
+The async redemption flow is protocol-side and not exposed as instruction
+builders through this crate. The crate provides:
 
-```rust
-use onre_titan::redemption::*;
+- `RedemptionOffer::load` — deserializes the redemption offer account
+- `RedemptionOffer::is_disabled` — checks the v5 disabled flag
 
-// 1. Read the redemption offer (counter seeds the new request PDA)
-let ro = RedemptionOffer::load(&redemption_offer_account.data)?;
+The redemption offer feeds sell-side pricing parameters:
+`fee_basis_points_prop_amm_sell` (the sell fee rate) and `vault_target_bps`
+(the liquidity cap target for the redemption vault).
 
-// 2. Create the request (locks ONyc in the redemption vault)
-let ix = build_create_redemption_request_instruction(
-    &redeemer, &onyc_mint, &usdg_mint, amount, ro.request_counter,
-);
-
-// 3. Track it
-let (request_pda, _) = find_redemption_request_pda(&redemption_offer_pda, ro.request_counter);
-let status = redemption_request_status(account_data)?; // Pending | PartiallyFulfilled | Closed
-```
-
-The program closes the request account when it is fully fulfilled or
-cancelled, so a missing account maps to `Closed`.
+Async redemption locks ONyc and waits for protocol-side fulfillment. It is
+not an atomic swap and must not be exposed as Titan's sell route.
 
 ### Emergency states
 
@@ -192,18 +191,11 @@ The current scaffold covers these known Titan requirements:
 - ✅ Strict sell return-data origin, length and request binding
 - ✅ Exact v5 instruction discriminators and account ordering
 - ✅ Returns `QuoteResult` with `not_enough_liquidity` flag
-- ✅ Generates permissionless-v2 buy and Prop AMM sell instructions
+- ✅ Generates Prop AMM buy (`open_swap_buy`) and sell (`open_swap_sell`) instructions
 
 Still required before production enablement: wire Titan's real adapter to its
 simulation/return-data API, run the same suite against the funded deployment,
 and confirm the 5 bps partner accounting path end to end.
-
-## Dependencies
-
-- `solana-sdk = "2.2.1"`
-- `spl-token = "7"`
-- `spl-token-2022 = "9"`
-- `async-trait = "0.1"`
 
 ## License
 
